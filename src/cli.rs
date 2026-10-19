@@ -22,7 +22,7 @@ pub enum Command {
     New(NewArgs),
     #[command(
         alias = "list",
-        about = "List active forks: work to land, what's running; * marks the one you're in"
+        about = "List active forks: work to land, what's running; * marks the one you're in. Outside a repo: every repo's forks"
     )]
     Ls(LsArgs),
     #[command(about = "Print a fork's base port (the rest of its block follows)")]

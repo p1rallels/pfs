@@ -621,6 +621,36 @@ repo "$mains/homeless"
 check "with PFS_HOME unset, forks land in \$HOME/.pfs/forks" test -d "$mains/home/.pfs/forks/homeless/1"
 check "  …and the config comes from \$HOME/.pfs too" test "$(cd "$mains/homeless" && mkdir -p "$mains/home/.pfs" && printf '[ports]\nbase = 42000\n' >"$mains/home/.pfs/config.toml" && env -u PFS_HOME HOME="$mains/home" "$PFS" port 1)" = 42010
 
+section "pfs ls outside any repo: every repo's forks"
+outside=$(mktemp -d /tmp/pfs-hammer-outside.XXXXXX)
+ev_home="$mains/ev-home"
+ev() { (cd "$1" && shift && PFS_HOME="$ev_home" "$PFS" "$@"); }
+check "no forks dir yet: says so" contains "$(ev "$outside" ls)" "no forks in"
+repo "$mains/ev-here"
+repo "$mains/ev-gone"
+ev "$mains/ev-here" new a -q >/dev/null && ev "$mains/ev-here" new b -q >/dev/null
+gone_fork=$(ev "$mains/ev-gone" new wip -q)
+gone_dir=$(ev "$mains/ev-gone" path "$gone_fork")
+(cd "$gone_dir" && echo x >x && git add -A && git -c user.name=t -c user.email=t@t commit -qm work && echo y >y)
+out=$(ev "$outside" ls)
+check "a main with forks: one line, its forks counted" grep -qE "^ev-here +.*/ev-here +2 forks$" <<<"$out"
+check "  …and nothing more about it" test "$(grep -c 'ev-here' <<<"$out")" -eq 1
+mv "$mains/ev-gone" "$mains/ev-moved"
+out=$(ev "$outside" ls)
+check "a main that's gone: flagged" contains "$out" "its folder is gone: it may have moved"
+check "  …with its fork's work" contains "$out" "$gone_fork-wip (1 commit · uncommitted)"
+check "  …and how to keep it" contains "$out" "push <remote or repo> pfs/$gone_fork-wip"
+ev "$mains/ev-moved" ls >/dev/null
+check "  …until pfs runs in the moved main: here again" denied contains "$(ev "$outside" ls)" "its folder is gone"
+mv "$mains/ev-moved" "$mains/ev-away" && mkdir "$mains/ev-moved"
+check "a plain folder where the main was: replaced" contains "$(ev "$outside" ls)" "something else is there, not a repo"
+ev "$mains/ev-here" rm 1 2 >/dev/null
+check "a main whose forks are all removed drops off" denied contains "$(ev "$outside" ls)" "ev-here"
+mkdir -p "$ev_home/forks/ev-here/.rm-9"
+check "  …and a delete in progress isn't a fork" denied contains "$(ev "$outside" ls)" "ev-here"
+check "--json outside a repo: refused" denied ev "$outside" ls --json
+rm -rf "$outside"
+
 section "nested repos and pipes"
 inner="$forks/3/inner"
 git init -q "$inner"

@@ -4,7 +4,6 @@
 //! main's path, the main's `.git/pfs/forks-dir` the per-repo folder's. When a
 //! main is deleted, moved or replaced, its forks stay behind with work that
 //! exists nowhere else, and this is where they turn up again.
-#![allow(dead_code)]
 
 use std::{
     fs,

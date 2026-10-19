@@ -66,6 +66,18 @@ pub fn here() -> Result<Place> {
     locate(&cwd)
 }
 
+/// `here`, or `None` outside any repo.
+pub fn try_here() -> Result<Option<Place>> {
+    let cwd = std::env::current_dir().context("can't read the current folder")?;
+    let resolved = cwd
+        .canonicalize()
+        .with_context(|| format!("can't resolve {}", cwd.display()))?;
+    match nearest_repo(&resolved) {
+        None => Ok(None),
+        Some(_) => locate(&cwd).map(Some),
+    }
+}
+
 pub fn locate(dir: &Path) -> Result<Place> {
     let cwd = dir
         .canonicalize()

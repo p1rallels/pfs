@@ -1,11 +1,11 @@
 use std::{collections::BTreeMap, path::Path, thread};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::{
     cli::LsArgs,
-    clock, config,
+    clock, config, everywhere,
     forks::{self, Fork},
     git,
     ledger::{self, Entry},
@@ -17,7 +17,27 @@ use crate::{
 const BIG_LOG: u64 = 1024 * 1024 * 1024;
 
 pub fn run(args: LsArgs) -> Result<i32> {
-    let place = place::here()?;
+    match place::try_here()? {
+        Some(place) => in_repo(args, place),
+        None => every_repo(args),
+    }
+}
+
+/// Outside any repo: every main's forks, from the forks dir, and the forks
+/// whose main isn't there anymore.
+fn every_repo(args: LsArgs) -> Result<i32> {
+    if args.all || args.json || args.overlap {
+        bail!("--all, --json and --overlap work inside a repo. outside one, `pfs ls` lists every repo's forks");
+    }
+    let config = config::load_global()?;
+    let repos = everywhere::scan(&config.forks_dir)?;
+    everywhere::render(&config.forks_dir, &repos, paths::tildify)
+        .iter()
+        .for_each(|line| println!("{line}"));
+    Ok(0)
+}
+
+fn in_repo(args: LsArgs, place: place::Place) -> Result<i32> {
     let config = config::load_global()?;
     let ledger = ledger::load(&place.repo)?;
     let active: Vec<Fork> = forks::active_ids(&place.repo)
