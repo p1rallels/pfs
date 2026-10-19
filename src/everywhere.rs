@@ -702,7 +702,7 @@ mod tests {
             per_repo("empty", Some("/Users/u/src/empty"), State::Here, vec![]),
             per_repo(
                 "pfs-cli",
-                Some("/Users/u/Desktop/cc/pfs-cli"),
+                Some("/Users/u/code/tools/pfs-cli"),
                 State::Here,
                 vec![fork(18, "", None), fork(19, "", None)],
             ),
@@ -730,7 +730,7 @@ mod tests {
                 "  this work exists only in ~/.pfs/forks/demo: keep a fork's by committing it and pushing or fetching \
                  its branch somewhere (git -C ~/.pfs/forks/demo/3 push <remote or repo> pfs/3-wait), or drop it all \
                  by deleting ~/.pfs/forks/demo. pfs itself never deletes these",
-                "pfs-cli   ~/Desktop/cc/pfs-cli   2 forks",
+                "pfs-cli   ~/code/tools/pfs-cli   2 forks",
                 "web       ~/src/web              1 fork",
                 "  its folder was replaced: the repo there keeps its forks in ~/.pfs/forks/web-2, so it or this \
                  folder was moved or copied",
