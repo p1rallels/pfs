@@ -2,7 +2,6 @@
 
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
 };
@@ -249,25 +248,4 @@ pub fn incoming_paths(dir: &Path, ours: &str, theirs: &str) -> Result<Vec<String
 
 fn nul_list(listed: &str) -> impl Iterator<Item = String> + '_ {
     listed.split('\0').filter(|path| !path.is_empty()).map(str::to_string)
-}
-
-/// Adds `pattern` to `.git/info/exclude` once.
-pub fn exclude(root: &Path, pattern: &str) -> Result<()> {
-    let info = git_dir(root).join("info");
-    fs::create_dir_all(&info).context("can't create .git/info")?;
-    let path = info.join("exclude");
-    let current = fs::read_to_string(&path).unwrap_or_default();
-    if current.lines().any(|line| line.trim() == pattern) {
-        return Ok(());
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .context("can't open .git/info/exclude")?;
-    let separator = match current.is_empty() || current.ends_with('\n') {
-        true => "",
-        false => "\n",
-    };
-    writeln!(file, "{separator}{pattern}").context("can't write .git/info/exclude")
 }

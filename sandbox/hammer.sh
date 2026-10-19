@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Hammers pfs in a fresh toy repo: forks, runs and their waiters, rm,
 # concurrency, a fake agent run like a real sub. PASS/FAIL per check; exits 1
-# on any failure. Uses its own config and session dirs under sandbox/work, so
-# it runs from a normal shell or from inside a pfs fork alike.
+# on any failure. Uses its own PFS_HOME (config and forks) and session dirs
+# under sandbox/work, so it runs from a normal shell or from inside a pfs fork
+# alike, and never touches your ~/.pfs.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 work="$here/work"
 toy="$work/toy"
+mains="$work/mains"
 PFS="${PFS:-$repo/target/debug/pfs}"
 
-export XDG_CONFIG_HOME="$work/config"
+export PFS_HOME="$work/pfs-home"
 export PI_CODING_AGENT_SESSION_DIR="$work/sessions"
 export PI_CODING_AGENT_DIR="$work/agent"
 unset PI_SESSION_ID PI_SESSION_FILE
@@ -38,6 +40,10 @@ started_pid() { sed -n 's/.*(pid \([0-9]*\)).*/\1/p' <<<"$1"; }
 new_id() { sed -n 's/^created \([0-9]*\)-.*/\1/p' <<<"$1"; }
 field() { tr -d ' ' <<<"$1"; }
 real() { (cd "$1" && pwd -P); }
+# numbered <forks folder>: how many forks are in it right now
+numbered() { ls "$1" 2>/dev/null | grep -c '^[0-9][0-9]*$'; }
+# repo <dir>: a bare-bones main with one commit
+repo() { mkdir -p "$1" && git -C "$1" init -q -b main && git -C "$1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init; }
 # fake_conversation <file> <fork dir> <id> <last message>: a pi session file
 # whose first line puts it in that fork, ending on that message.
 fake_conversation() {
@@ -49,59 +55,79 @@ tool_result='{"role":"toolResult","content":[]}'
 stopped='{"role":"assistant","content":[],"stopReason":"stop"}'
 
 (cd "$repo" && cargo build -q) || exit 1
-rm -rf "$work/config" "$work/sessions" "$work/agent" "$work/scratch" "$work/repo-cache" "$work/global-cache"
-mkdir -p "$XDG_CONFIG_HOME/pfs" "$PI_CODING_AGENT_SESSION_DIR" "$work/scratch"
+rm -rf "$PFS_HOME" "$mains" "$work/sessions" "$work/agent" "$work/scratch" "$work/repo-cache" "$work/global-cache"
+mkdir -p "$PI_CODING_AGENT_SESSION_DIR" "$work/scratch"
 agent="$here/fake-agent.sh"
 "$here/make-toy.sh" >/dev/null || exit 1
 cd "$toy" || exit 1
+ledger=.git/pfs/ledger.jsonl
 
 section "pfs new"
+exclude_before=$(cat .git/info/exclude 2>/dev/null)
 echo "wip" >>README.md
 t0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
 out=$("$PFS" new add-csv)
 t1=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
 info "$out ($(echo "$t1 - $t0" | bc)s)"
-check "fork 1 created" test -d .forks/1
-check "on branch pfs/1-add-csv" test "$(git -C .forks/1 branch --show-current)" = pfs/1-add-csv
-check "node_modules came along" test -d .forks/1/node_modules
-check ".env came along" test -f .forks/1/.env
-check "venv came along" test -x .forks/1/.venv/bin/python
-check "uncommitted main work came along" grep -q wip .forks/1/README.md
+forks=$(cat .git/pfs/forks-dir)
+check "main records its forks folder: <forks dir>/toy" test "$forks" = "$(real "$PFS_HOME")/forks/toy"
+check "fork 1 created there" test -d "$forks/1"
+check "  …and new says where" contains "$out" "/pfs-home/forks/toy/1 (branch pfs/1-add-csv"
+check "the toy has no .forks" test ! -e "$toy/.forks"
+check "  …and nothing new in .git/info/exclude" test "$(cat .git/info/exclude 2>/dev/null)" = "$exclude_before"
+check "the forks folder's .main names the toy" test "$(cat "$forks/.main")" = "$(real "$toy")"
+check "  …and its README.md says to remove forks with pfs rm, never by hand" grep -q 'pfs rm <n>.*never by hand' "$forks/README.md"
+check "PFS_HOME, the forks dir and the toy's folder are 0700" test "$(stat -f %Lp "$PFS_HOME" "$PFS_HOME/forks" "$forks" | sort -u)" = 700
+check "on branch pfs/1-add-csv" test "$(git -C "$forks/1" branch --show-current)" = pfs/1-add-csv
+check "node_modules came along" test -d "$forks/1/node_modules"
+check ".env came along" test -f "$forks/1/.env"
+check "venv came along" test -x "$forks/1/.venv/bin/python"
+check "uncommitted main work came along" grep -q wip "$forks/1/README.md"
 check "  …and new says so, naming it" grep -qE "note: main's uncommitted (README.md came along|work came along \([0-9]+ files: [^)]*README.md)" <<<"$out"
-check "ledger has fork 1" grep -q '"type":"fork","id":1,' .forks/ledger.jsonl
-check ".forks is hidden from main's git" test -z "$(git status --porcelain --untracked-files=all | grep forks)"
-check "the fork has no .forks of its own" test ! -e .forks/1/.forks
+check "ledger has fork 1" grep -q '"type":"fork","id":1,' "$ledger"
+check "the fork has no ledger or forks record of its own" test ! -e "$forks/1/.git/pfs/ledger.jsonl" -a ! -e "$forks/1/.git/pfs/forks-dir"
+check "  …and no .forks" test ! -e "$forks/1/.forks"
 check "diff is empty at start (main's wip isn't the fork's change)" test -z "$("$PFS" diff 1)"
 git checkout -q README.md
 
 "$PFS" new clean --from HEAD~1 >/dev/null
-check "--from starts at that commit" test "$(git -C .forks/2 rev-parse HEAD)" = "$(git rev-parse HEAD~1)"
-check "--from drops tracked changes" denied grep -q "step 2" .forks/2/README.md
-check "--from keeps ignored files (.env)" test -f .forks/2/.env
+check "--from starts at that commit" test "$(git -C "$forks/2" rev-parse HEAD)" = "$(git rev-parse HEAD~1)"
+check "--from drops tracked changes" denied grep -q "step 2" "$forks/2/README.md"
+check "--from keeps ignored files (.env)" test -f "$forks/2/.env"
 
 out=$("$PFS" new 7-add-csv)
 check "a leading number is pfs's, not the label's" contains "$out" "created 3-add-csv"
+before=$(numbered "$forks")
 check "a bad --from fails cleanly" denied "$PFS" new nope --from no-such-rev
-check "  …and leaves no folder" test "$(ls .forks | grep -c '^[0-9]')" -eq 3
+check "  …and leaves no folder" test "$(numbered "$forks")" -eq "$before"
 check "a bare number isn't a name" denied "$PFS" new 5
 check "  …the error points at --of and open" contains "$("$PFS" new 5 2>&1)" "pfs new --of 5"
-check "  …and leaves no folder" test "$(ls .forks | grep -c '^[0-9]')" -eq 3
+check "  …and leaves no folder" test "$(numbered "$forks")" -eq "$before"
+
+section "pfs path"
+check "pfs path 1 is fork 1's folder" test "$("$PFS" path 1)" = "$forks/1"
+check "  …so cd \"\$(pfs path 1)\" works" test "$(cd "$("$PFS" path 1)" && git branch --show-current)" = pfs/1-add-csv
+check "inside a fork, the number is optional" test "$(cd "$forks/1/node_modules" && "$PFS" path)" = "$forks/1"
+check "  …and another fork's works too" test "$(cd "$forks/1" && "$PFS" path 2)" = "$forks/2"
+check "in main, it needs a number" denied "$PFS" path
+check "an unknown fork is an error" denied "$PFS" path 99
+check "  …saying so" contains "$("$PFS" path 99 2>&1)" "no fork 99"
 
 section "runs"
 check "a command writes in its fork" "$PFS" run 1 sh -c 'echo ok > inside.txt'
-check "  …landed" test -f .forks/1/inside.txt
+check "  …landed" test -f "$forks/1/inside.txt"
 check "git commit inside" "$PFS" run 1 git commit -qm "fix: two words" --allow-empty
-check "  …argv arrives intact" test "$(git -C .forks/1 log -1 --format=%s)" = "fix: two words"
+check "  …argv arrives intact" test "$(git -C "$forks/1" log -1 --format=%s)" = "fix: two words"
 "$PFS" run 1 sh -c 'exit 7' >/dev/null 2>&1
 code=$?
 check "exit codes pass through (7)" test "$code" -eq 7
 check "\$PORT is the fork's (3 → 40030)" test "$("$PFS" run 3 sh -c 'echo $PORT')" = 40030
-check "pfs port inside fork 1" test "$(cd .forks/1 && "$PFS" port)" = 40010
+check "pfs port inside fork 1" test "$(cd "$forks/1" && "$PFS" port)" = 40010
 check "pfs port in main needs a number" denied "$PFS" port
 check "pfs port 5 from main" test "$("$PFS" port 5)" = 40050
-check "foreground runs are recorded" grep -q '"kind":"fg"' .forks/1/.git/pfs/runs.jsonl
+check "foreground runs are recorded" grep -q '"kind":"fg"' "$forks/1/.git/pfs/runs.jsonl"
 check "unknown commands fail early" denied "$PFS" run 1 no-such-cmd-xyz
-check "inside a subfolder, runs start there" test "$(cd .forks/1/node_modules && "$PFS" run pwd)" = "$toy/.forks/1/node_modules"
+check "inside a subfolder, runs start there" test "$(cd "$forks/1/node_modules" && "$PFS" run pwd)" = "$forks/1/node_modules"
 
 section "background runs"
 out=$("$PFS" run 1 --bg 'echo hello; sleep 2; echo bye')
@@ -109,10 +135,10 @@ run=$(started_run "$out")
 check "started" test -n "$run"
 check "pfs ls shows it" contains "$("$PFS" ls)" "bg 1.$run running"
 sleep 3
-check "exit recorded by the waiter" grep -q "\"type\":\"exit\",\"run\":$run,\"code\":0" .forks/1/.git/pfs/runs.jsonl
+check "exit recorded by the waiter" grep -q "\"type\":\"exit\",\"run\":$run,\"code\":0" "$forks/1/.git/pfs/runs.jsonl"
 check "pfs logs has the output" test "$("$PFS" logs "1.$run")" = "$(printf 'hello\nbye')"
-check "the log lives in .git/pfs" test -f ".forks/1/.git/pfs/$run.log"
-check "git doesn't see logs" test -z "$(git -C .forks/1 status --porcelain | grep '\.log')"
+check "the log lives in .git/pfs" test -f "$forks/1/.git/pfs/$run.log"
+check "git doesn't see logs" test -z "$(git -C "$forks/1" status --porcelain | grep '\.log')"
 out=$("$PFS" run 1 --bg 'for i in 1 2 3; do echo tick $i; sleep 0.4; done')
 check "pfs logs -f follows to the end" test "$("$PFS" logs -f "1.$(started_run "$out")" | wc -l | tr -d ' ')" -eq 3
 
@@ -135,7 +161,7 @@ pid=$(started_pid "$(cat "$work/pgkill.out")")
 check "killing the caller's process group (pi timeout/esc) spares the run" kill -0 "$pid"
 kill -- -"$pid" 2>/dev/null
 sleep 0.3
-check "  …and the waiter records the kill" grep -q '"signal":15' .forks/1/.git/pfs/runs.jsonl
+check "  …and the waiter records the kill" grep -q '"signal":15' "$forks/1/.git/pfs/runs.jsonl"
 
 section "pfs rm"
 out=$("$PFS" run 1 --bg sleep 30)
@@ -151,9 +177,11 @@ code=$?
 check "works once committed" test "$code" -eq 0
 check "  …with a plain merge note" contains "$out" "vs main right now: merges clean"
 check "  …branch saved in main" git rev-parse -q --verify refs/heads/pfs/1-add-csv
-check "  …folder gone" test ! -e .forks/1
-check "  …ledger rm line" grep -q '"type":"rm","id":1,' .forks/ledger.jsonl
-check "  …no trash left" test -z "$(ls -A .forks | grep '^\.rm-')"
+check "  …folder gone" test ! -e "$forks/1"
+check "  …ledger rm line" grep -q '"type":"rm","id":1,' "$ledger"
+check "  …no trash left" test -z "$(ls -A "$forks" | grep '^\.rm-')"
+check "pfs path of a removed fork is an error" denied "$PFS" path 1
+check "  …saying it was removed" contains "$("$PFS" path 1 2>&1)" "fork 1 was removed"
 check "pfs ls --all lists it" contains "$("$PFS" ls --all)" "removed"
 check "  …with its saved branch" grep -q "1-add-csv .*saved pfs/1-add-csv$" <<<"$("$PFS" ls --all)"
 git branch -q -m pfs/1-add-csv hammer-aside
@@ -162,26 +190,26 @@ git branch -q -m hammer-aside pfs/1-add-csv
 check "a removed fork gives a useful error" contains "$("$PFS" run 1 true 2>&1)" "was removed"
 out=$("$PFS" new after-rm)
 check "ids are never reused" contains "$out" "created 4-after-rm"
-echo scratch >.forks/4/scratch.txt
+echo scratch >"$forks/4/scratch.txt"
 check "--force drops uncommitted work" "$PFS" rm 4 --force
 check "  …no commits, so no branch saved" denied git rev-parse -q --verify refs/heads/pfs/4-after-rm
-check "pfs rm needs the main folder" denied sh -c "cd .forks/2 && '$PFS' rm 3"
+check "pfs rm needs the main folder" denied sh -c "cd '$forks/2' && '$PFS' rm 3"
 
 section "pfs diff"
-(cd .forks/2 && echo changed >>README.md && echo new >untracked.txt)
+(cd "$forks/2" && echo changed >>README.md && echo new >untracked.txt)
 "$PFS" run 2 sh -c 'echo c > committed.txt && git add committed.txt && git commit -qm c' >/dev/null
 diff_stat=$("$PFS" diff 2 --stat)
 check "shows uncommitted edits" contains "$diff_stat" "README.md"
 check "shows untracked files" contains "$diff_stat" "untracked.txt"
 check "shows commits" contains "$diff_stat" "committed.txt"
 check "takes pathspecs after --" test "$("$PFS" diff 2 --name-only -- README.md)" = "README.md"
-check "leaves the fork's real index alone" test -z "$(git -C .forks/2 diff --cached --name-only)"
+check "leaves the fork's real index alone" test -z "$(git -C "$forks/2" diff --cached --name-only)"
 
 section "git in a fork"
 check "git stash and branches work" "$PFS" run 2 sh -c 'echo s > stash.txt && git add stash.txt && git stash -q && git switch -q -c side && git switch -q pfs/2-clean && git stash pop -q && git reset -q && rm stash.txt'
 check "git config works: a fork's settings are its own" "$PFS" run 2 git config pfs.probe yes
 check "  …and never reach main" denied git config --get pfs.probe
-git -C .forks/2 config --unset pfs.probe
+git -C "$forks/2" config --unset pfs.probe
 printf 'notes\n' >main-wip.txt
 
 section "from inside a fork"
@@ -193,9 +221,9 @@ check "pfs rm fails: it runs from the main folder" denied "$PFS" run 3 "$PFS" rm
 check "pfs run --bg works" contains "$("$PFS" run 3 "$PFS" run --bg 'echo inner')" "started 3."
 sleep 0.5
 check "  …and its log is readable" contains "$("$PFS" logs 3)" "inner"
-check "pfs run into another fork works" test "$("$PFS" run 3 "$PFS" run 2 pwd)" = "$toy/.forks/2"
+check "pfs run into another fork works" test "$("$PFS" run 3 "$PFS" run 2 pwd)" = "$forks/2"
 check "pfs diff into another fork works" contains "$("$PFS" run 3 "$PFS" diff 2 --stat)" "committed.txt"
-check "pfs open into another fork works" contains "$(printf 'pwd\n' | SHELL=/bin/sh "$PFS" run 3 "$PFS" open 2 2>&1)" "$toy/.forks/2"
+check "pfs open into another fork works" contains "$(printf 'pwd\n' | SHELL=/bin/sh "$PFS" run 3 "$PFS" open 2 2>&1)" "$forks/2"
 check "pfs port" test "$("$PFS" run 3 "$PFS" port)" = 40030
 check "pfs diff" "$PFS" run 3 "$PFS" diff
 
@@ -203,32 +231,33 @@ section "no walls: old settings are ignored"
 check "pfs allow is gone" denied "$PFS" allow
 check "  …and so is pfs new --allow" denied "$PFS" new x --allow /tmp
 check "runs get no git settings from pfs" test "$("$PFS" run 3 sh -c 'env | grep ^GIT_CONFIG | sort')" = "$(env | grep ^GIT_CONFIG | sort)"
-printf '[wall]\nallow = ["~/.m2"]\nlock_git_settings = false\n\n[ports]\nbase = 41000\n' >"$XDG_CONFIG_HOME/pfs/config.toml"
+printf '[wall]\nallow = ["~/.m2"]\nlock_git_settings = false\n\n[ports]\nbase = 41000\n' >"$PFS_HOME/config.toml"
 check "an old [wall] table in the config is ignored, its [ports] still read" test "$("$PFS" port 5)" = 41050
-rm "$XDG_CONFIG_HOME/pfs/config.toml"
+rm "$PFS_HOME/config.toml"
 printf '[wall]\nallow = ["~", "../toy"]\nlock_git_settings = true\n' >.pfs.toml
 check "an old .pfs.toml is ignored" test -z "$("$PFS" run 3 true 2>&1)"
 check "  …git config works in a fork" "$PFS" run 3 git config pfs.probe yes
-git -C .forks/3 config --unset pfs.probe
+git -C "$forks/3" config --unset pfs.probe
 rm .pfs.toml
-printf '{"type":"allow","id":3,"path":"/opt/cache","ts":"2026-01-01T00:00:00.000Z"}\n' >>.forks/ledger.jsonl
+printf '{"type":"allow","id":3,"path":"/opt/cache","ts":"2026-01-01T00:00:00.000Z"}\n' >>"$ledger"
 check "an old allow line in the ledger changes nothing" contains "$("$PFS" ls)" "3-add-csv"
 
 section "20 forks at once"
-before=$(grep -c '"type":"fork"' .forks/ledger.jsonl)
+before=$(grep -c '"type":"fork"' "$ledger")
+live=$(numbered "$forks")
 t0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
 seq 1 20 | xargs -P 20 -I{} "$PFS" new burst-{} >/dev/null 2>&1
 t1=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
 info "20 parallel pfs new: $(echo "$t1 - $t0" | bc)s"
-after=$(grep -c '"type":"fork"' .forks/ledger.jsonl)
+after=$(grep -c '"type":"fork"' "$ledger")
 check "20 new fork lines" test $((after - before)) -eq 20
-check "no id twice" test -z "$(jq -r 'select(.type=="fork") | .id' .forks/ledger.jsonl | sort | uniq -d)"
-check "every ledger line parses" jq -e . .forks/ledger.jsonl
-burst=$(jq -r 'select(.type=="fork" and (.name // "" | startswith("burst"))) | .id' .forks/ledger.jsonl)
-rms_before=$(grep -c '"type":"rm"' .forks/ledger.jsonl)
+check "no id twice" test -z "$(jq -r 'select(.type=="fork") | .id' "$ledger" | sort | uniq -d)"
+check "every ledger line parses" jq -e . "$ledger"
+burst=$(jq -r 'select(.type=="fork" and (.name // "" | startswith("burst"))) | .id' "$ledger")
+rms_before=$(grep -c '"type":"rm"' "$ledger")
 echo "$burst" | xargs -P 20 -I{} "$PFS" rm {} >/dev/null 2>&1
-check "20 parallel rm" test $(($(grep -c '"type":"rm"' .forks/ledger.jsonl) - rms_before)) -eq 20
-check "  …folders gone" test "$(ls .forks | grep -c '^[0-9]')" -eq 2
+check "20 parallel rm" test $(($(grep -c '"type":"rm"' "$ledger") - rms_before)) -eq 20
+check "  …folders gone" test "$(numbered "$forks")" -eq "$live"
 
 section "a sub is a chained bg run (fake pi)"
 id=$(PI_SESSION_ID=parent-0001 "$PFS" new agent-test -q)
@@ -238,24 +267,24 @@ check "pfs ls: bg running" contains "$("$PFS" ls)" "bg $id.1 running"
 sleep 2.5
 check "pfs ls: how it ended, once it ended" contains "$("$PFS" ls)" "bg $id.1 done"
 log=$("$PFS" logs "$id")
-check "it worked in its fork" contains "$log" "cwd=$toy/.forks/$id"
+check "it worked in its fork" contains "$log" "cwd=$forks/$id"
 check "it got its port" contains "$log" "port=$("$PFS" port "$id")"
 check "it got its task" contains "$log" "task=write a note sleep 1"
-check "it committed on its branch" test "$(git -C ".forks/$id" log -1 --format=%s)" = "fake agent: write a note sleep 1"
-check "the parent session is in the ledger" grep -q "\"id\":$id,.*\"parent_session\":\"parent-0001\"" .forks/ledger.jsonl
+check "it committed on its branch" test "$(git -C "$forks/$id" log -1 --format=%s)" = "fake agent: write a note sleep 1"
+check "the parent session is in the ledger" grep -q "\"id\":$id,.*\"parent_session\":\"parent-0001\"" "$ledger"
 check "pfs logs is its output, nothing about lookup" denied contains "$log" "lookup"
 check "--agent is gone" denied "$PFS" new gone --agent "x"
-printf '{"type":"start","run":7,"kind":"agent","cmd":"pi: old","pid":1,"session":"s","ts":"2026-01-01T00:00:00.000Z"}\n{"type":"exit","run":7,"code":0,"ts":"2026-01-01T00:01:00.000Z"}\n' >>".forks/$id/.git/pfs/runs.jsonl"
+printf '{"type":"start","run":7,"kind":"agent","cmd":"pi: old","pid":1,"session":"s","ts":"2026-01-01T00:00:00.000Z"}\n{"type":"exit","run":7,"code":0,"ts":"2026-01-01T00:01:00.000Z"}\n' >>"$forks/$id/.git/pfs/runs.jsonl"
 check "an old agent run still reads, as bg" contains "$("$PFS" ls)" "bg $id.7 done"
 check "  …and its log is a bg run's" contains "$("$PFS" logs "$id.7" 2>&1)" "can't open"
 
 section "pfs open (the door)"
 door=$(printf 'echo "port=$PORT"; pwd\n' | SHELL=/bin/sh "$PFS" open 3 2>&1)
-check "a shell in the fork" contains "$door" "$toy/.forks/3"
+check "a shell in the fork" contains "$door" "$forks/3"
 check "  …with the fork's port" contains "$door" "port=40030"
 check "  …says where you are" contains "$door" "fork 3-add-csv · branch pfs/3-add-csv · ports 40030-40039"
 check "  …and nothing about walls" denied contains "$door" "wall"
-check "  …recorded as an open run" grep -q '"kind":"open"' .forks/3/.git/pfs/runs.jsonl
+check "  …recorded as an open run" grep -q '"kind":"open"' "$forks/3/.git/pfs/runs.jsonl"
 check "pfs open in main needs a number" denied "$PFS" open
 id=$("$PFS" new door-agent -q)
 "$PFS" run "$id" --bg -q "$agent" -p "wait sleep 3" >/dev/null
@@ -265,22 +294,22 @@ check "  …and nothing about pi or sessions" denied grep -qwiE 'pi|session' <<<
 sleep 3.5
 
 section "pfs new --of (a fork of a fork, folders stay flat)"
-echo "half-done" >.forks/3/wip.txt
+echo "half-done" >"$forks/3/wip.txt"
 out=$("$PFS" new of-three --of 3)
 id=$(new_id "$out")
 check "created" test -n "$id"
 check "  …says what it copied" contains "$out" "a copy of fork 3-add-csv as it is now"
-check "  …lives flat in .forks" test -d ".forks/$id"
-check "  …has fork 3's uncommitted work" test -f ".forks/$id/wip.txt"
-check "  …starts at fork 3's commit" test "$(git -C ".forks/$id" rev-parse HEAD)" = "$(git -C .forks/3 rev-parse HEAD)"
-check "  …on its own branch" test "$(git -C ".forks/$id" branch --show-current)" = "pfs/$id-of-three"
+check "  …lives flat, next to fork 3" test -d "$forks/$id"
+check "  …has fork 3's uncommitted work" test -f "$forks/$id/wip.txt"
+check "  …starts at fork 3's commit" test "$(git -C "$forks/$id" rev-parse HEAD)" = "$(git -C "$forks/3" rev-parse HEAD)"
+check "  …on its own branch" test "$(git -C "$forks/$id" branch --show-current)" = "pfs/$id-of-three"
 check "  …diff is empty at start" test -z "$("$PFS" diff "$id")"
-check "  …the ledger knows it's of 3" grep -q "\"id\":$id,.*\"of\":3" .forks/ledger.jsonl
+check "  …the ledger knows it's of 3" grep -q "\"id\":$id,.*\"of\":3" "$ledger"
 check "  …pfs ls shows it" contains "$("$PFS" ls)" "of 3"
-check "fork 3 is untouched" test "$(git -C .forks/3 branch --show-current)" = pfs/3-add-csv
+check "fork 3 is untouched" test "$(git -C "$forks/3" branch --show-current)" = pfs/3-add-csv
 check "--of and --from don't mix" denied "$PFS" new x --of 3 --from HEAD
 check "--of a fork that doesn't exist fails" denied "$PFS" new x --of 99
-rm .forks/3/wip.txt
+rm "$forks/3/wip.txt"
 "$PFS" rm "$id" --force >/dev/null
 
 section "pfs new --from a live fork's branch"
@@ -288,10 +317,10 @@ section "pfs new --from a live fork's branch"
 out=$("$PFS" new from-live --from pfs/3-add-csv)
 id=$(new_id "$out")
 check "works while fork 3 is open" test -n "$id"
-check "  …at fork 3's latest commit" test "$(git -C ".forks/$id" rev-parse HEAD)" = "$(git -C .forks/3 rev-parse HEAD)"
+check "  …at fork 3's latest commit" test "$(git -C "$forks/$id" rev-parse HEAD)" = "$(git -C "$forks/3" rev-parse HEAD)"
 check "  …says where it came from" contains "$out" "taken from its fork"
 check "  …main didn't get the branch" denied git rev-parse -q --verify refs/heads/pfs/3-add-csv
-check "  …no leftover ref" denied git -C ".forks/$id" rev-parse -q --verify refs/pfs/incoming
+check "  …no leftover ref" denied git -C "$forks/$id" rev-parse -q --verify refs/pfs/incoming
 check "  …pfs ls shows it" contains "$("$PFS" ls)" "from pfs/3-add-csv"
 "$PFS" rm "$id" --force >/dev/null
 
@@ -322,7 +351,7 @@ check "a fresh fork has nothing to land" denied contains "$(row "$id")" "commit"
 "$PFS" run "$id" sh -c 'echo one > one.txt && git add one.txt && git commit -qm one && echo two > two.txt && git add two.txt && git commit -qm two' >/dev/null
 check "its commits show" contains "$(row "$id")" "2 commits"
 check "  …main's untracked main-wip.txt it carries isn't its uncommitted work" denied contains "$(row "$id")" "uncommitted"
-echo edit >>".forks/$id/one.txt"
+echo edit >>"$forks/$id/one.txt"
 check "an edit after the commits shows" contains "$(row "$id")" "2 commits · uncommitted"
 check "  …in --json too" test "$("$PFS" ls --json | jq -r "select(.id==$id) | \"\\(.commits) \\(.uncommitted)\"")" = "2 true"
 check "rm refuses what ls calls uncommitted" denied "$PFS" rm "$id"
@@ -335,52 +364,52 @@ section "pfs rm with several forks"
 a=$(new_id "$("$PFS" new many-a)")
 b=$(new_id "$("$PFS" new many-b)")
 c=$(new_id "$("$PFS" new many-c)")
-echo dirty >".forks/$b/dirty.txt"
+echo dirty >"$forks/$b/dirty.txt"
 out=$("$PFS" rm "$a" "$b" "$c" 2>&1)
 code=$?
-check "removes the ones it can" test ! -e ".forks/$a" -a ! -e ".forks/$c"
-check "  …keeps the refused one" test -d ".forks/$b"
+check "removes the ones it can" test ! -e "$forks/$a" -a ! -e "$forks/$c"
+check "  …keeps the refused one" test -d "$forks/$b"
 check "  …says why and exits 1" test "$code" -eq 1 -a -n "$(grep "fork $b-many-b has uncommitted changes" <<<"$out")"
 check "  …and sums up what's left" contains "$out" "1 of 3 not removed ($b)"
 "$PFS" rm "$b" --force >/dev/null
 
 section "pfs rm: is anyone working here"
 id=$("$PFS" new busy -q)
-mkdir -p ".forks/$id/src" ".forks/${id}0x"
-(cd ".forks/$id/src" && exec sleep 30) &
+mkdir -p "$forks/$id/src" "$forks/${id}0x"
+(cd "$forks/$id/src" && exec sleep 30) &
 spid=$!
-(cd ".forks/${id}0x" && exec sleep 30) &
+(cd "$forks/${id}0x" && exec sleep 30) &
 npid=$!
 sleep 0.3
 out=$("$PFS" rm "$id" 2>&1)
 check "a process with its folder in the fork blocks rm" contains "$out" "pid $spid  sleep  (finish or quit it)"
 check "  …one in a folder whose name only starts the same doesn't" denied contains "$out" "pid $npid"
 check "  …--force doesn't skip it" denied "$PFS" rm "$id" --force
-check "  …the fork is still there" test -d ".forks/$id"
+check "  …the fork is still there" test -d "$forks/$id"
 check "  …and nothing was killed" kill -0 "$spid"
 kill "$spid" "$npid" 2>/dev/null
 wait "$spid" "$npid" 2>/dev/null
-rmdir ".forks/${id}0x"
+rmdir "$forks/${id}0x"
 check "  …once it's gone, rm goes through" "$PFS" rm "$id"
 
 id=$("$PFS" new talking -q)
 conv="$PI_CODING_AGENT_SESSION_DIR/hammer-$id.jsonl"
-fake_conversation "$conv" ".forks/$id" "0a1b2c3d-open" "$tool_use"
+fake_conversation "$conv" "$forks/$id" "0a1b2c3d-open" "$tool_use"
 out=$("$PFS" rm "$id" 2>&1)
 check "a pi conversation mid-turn in the fork blocks rm" contains "$out" "pi conversation 0a1b2c3d is mid-turn (running tools, last write"
 check "  …and says what to do if it crashed" contains "$out" "if it crashed: pfs rm $id --force"
 printf '{"type":"message","message":%s}\n' "$stopped" >>"$conv"
 check "  …closed, rm goes through" "$PFS" rm "$id"
 id=$("$PFS" new web -q)
-enc=$(real ".forks/$id" | sed 's|^/||; s|[/\\:]|-|g')
-fake_conversation "$PI_CODING_AGENT_DIR/sessions/--$enc--/web.jsonl" ".forks/$id" "0a1b2c3e-web" "$tool_result"
+enc=$(real "$forks/$id" | sed 's|^/||; s|[/\\:]|-|g')
+fake_conversation "$PI_CODING_AGENT_DIR/sessions/--$enc--/web.jsonl" "$forks/$id" "0a1b2c3e-web" "$tool_result"
 check "one filed the way pi and pi-web file them (sessions/--<path>--) counts too" contains "$("$PFS" rm "$id" 2>&1)" "pi conversation 0a1b2c3e is mid-turn (thinking"
 check "a conversation a crash left open: --force goes through" "$PFS" rm "$id" --force
 
 id=$("$PFS" new killed -q)
 pid=$(started_pid "$("$PFS" run "$id" --bg "$agent" -p "converse sleep 30")")
 sleep 0.5
-conv=$(grep -l "\"cwd\":\"$(real ".forks/$id")\"" "$PI_CODING_AGENT_SESSION_DIR"/fake-*.jsonl)
+conv=$(grep -l "\"cwd\":\"$(real "$forks/$id")\"" "$PI_CODING_AGENT_SESSION_DIR"/fake-*.jsonl)
 check "a fake sub keeps its conversation where pi would" test -n "$conv"
 out=$("$PFS" rm "$id" --force 2>&1)
 check "a sub at work blocks rm, --force or not" contains "$out" "$id.1 bg pid $pid"
@@ -391,26 +420,26 @@ check "killed mid-turn, the turn it left open doesn't block rm" "$PFS" rm "$id"
 id=$("$PFS" new killed-touched -q)
 pid=$(started_pid "$("$PFS" run "$id" --bg "$agent" -p "converse sleep 30")")
 sleep 0.5
-conv=$(grep -l "\"cwd\":\"$(real ".forks/$id")\"" "$PI_CODING_AGENT_SESSION_DIR"/fake-*.jsonl)
+conv=$(grep -l "\"cwd\":\"$(real "$forks/$id")\"" "$PI_CODING_AGENT_SESSION_DIR"/fake-*.jsonl)
 kill -- -"$pid"
 sleep 1.5
 touch "$conv"
 check "  …unless it was written to after the run ended" contains "$("$PFS" rm "$id" 2>&1)" "is mid-turn"
 "$PFS" rm "$id" --force >/dev/null
 id=$("$PFS" new died -q)
-printf '{"type":"start","run":1,"kind":"bg","cmd":"pi -p x","pid":999999,"ts":"2026-01-01T00:00:00.000Z"}\n' >>".forks/$id/.git/pfs/runs.jsonl"
-fake_conversation "$PI_CODING_AGENT_SESSION_DIR/hammer-$id.jsonl" ".forks/$id" "0a1b2c3f-died" "$tool_use"
+printf '{"type":"start","run":1,"kind":"bg","cmd":"pi -p x","pid":999999,"ts":"2026-01-01T00:00:00.000Z"}\n' >>"$forks/$id/.git/pfs/runs.jsonl"
+fake_conversation "$PI_CODING_AGENT_SESSION_DIR/hammer-$id.jsonl" "$forks/$id" "0a1b2c3f-died" "$tool_use"
 check "a died run (no exit line) clears nothing" contains "$("$PFS" rm "$id" 2>&1)" "is mid-turn"
 check "  …until --force" "$PFS" rm "$id" --force
 
 a=$("$PFS" new free -q)
 b=$("$PFS" new held -q)
-(cd ".forks/$b" && exec sleep 30) &
+(cd "$forks/$b" && exec sleep 30) &
 hpid=$!
 sleep 0.3
 "$PFS" rm "$a" "$b" >/dev/null 2>&1
 code=$?
-check "pfs rm a b with only b occupied removes a and keeps b" test ! -e ".forks/$a" -a -d ".forks/$b" -a "$code" -eq 1
+check "pfs rm a b with only b occupied removes a and keeps b" test ! -e "$forks/$a" -a -d "$forks/$b" -a "$code" -eq 1
 kill "$hpid" 2>/dev/null
 wait "$hpid" 2>/dev/null
 "$PFS" rm "$b" >/dev/null
@@ -424,15 +453,15 @@ check "an open door blocks rm" contains "$out" "$id.1 open pid"
 check "  …and says to exit that shell" contains "$out" "(exit that shell)"
 check "  …never to kill it" denied contains "$out" "kill"
 wait "$dpid"
-inside=$(printf 'cd ../.. && "%s" rm %s\n' "$PFS" "$id" | SHELL=/bin/sh "$PFS" open "$id" 2>&1)
+inside=$(printf 'cd "%s" && "%s" rm %s\n' "$toy" "$PFS" "$id" | SHELL=/bin/sh "$PFS" open "$id" 2>&1)
 check "rm typed inside the door says it's the door you're in" contains "$inside" "that's the door you're in: exit it, then rm from a normal shell"
-check "  …and keeps the fork" test -d ".forks/$id"
+check "  …and keeps the fork" test -d "$forks/$id"
 "$PFS" rm "$id" >/dev/null
 
 section "chaining: new -q, run --bg -q"
 qid=$("$PFS" new 98-quiet -q 2>"$work/quiet.err")
 check "new -q prints only the fork number" grep -qx '[0-9][0-9]*' <<<"$qid"
-check "  …and that's the fork it made" test "$(git -C ".forks/$qid" branch --show-current)" = "pfs/$qid-quiet"
+check "  …and that's the fork it made" test "$(git -C "$forks/$qid" branch --show-current)" = "pfs/$qid-quiet"
 check "  …notes go to stderr" grep -q 'became "quiet"' "$work/quiet.err"
 qrun=$("$PFS" run "$qid" --bg -q sleep 0.2)
 check "run --bg -q prints only <n>.<run>" test "$qrun" = "$qid.1"
@@ -506,8 +535,8 @@ ova=$(new_id "$("$PFS" new ov-a)")
 ovb=$(new_id "$("$PFS" new ov-b)")
 ovc=$(new_id "$("$PFS" new ov-c)")
 "$PFS" run "$ova" sh -c 'echo a >> README.md && git commit -qam "a edits readme"' >/dev/null
-echo b >>".forks/$ovb/README.md"
-echo c >".forks/$ovc/c.txt"
+echo b >>"$forks/$ovb/README.md"
+echo c >"$forks/$ovc/c.txt"
 overlap=$("$PFS" ls --overlap)
 check "a file two forks changed is listed with both" grep -q "README.md.*$ova-ov-a.*$ovb-ov-b" <<<"$overlap"
 check "  …a file only one fork changed isn't" denied grep -q "c.txt" <<<"$overlap"
@@ -518,27 +547,92 @@ inside=$("$PFS" run "$ova" "$PFS" ls --overlap)
 check "inside a fork, --overlap sees every fork too" grep -q "README.md.*$ova-ov-a.*$ovb-ov-b" <<<"$inside"
 check "  …and skips none" denied contains "$inside" "skipped"
 check "pfs diff into another fork from inside one works" contains "$("$PFS" run "$ova" "$PFS" diff "$ovb" --stat)" "README.md"
-check "  …and so does pfs run" test "$("$PFS" run "$ova" "$PFS" run "$ovb" pwd)" = "$toy/.forks/$ovb"
+check "  …and so does pfs run" test "$("$PFS" run "$ova" "$PFS" run "$ovb" pwd)" = "$forks/$ovb"
 frid=$("$PFS" new ov-from --from HEAD~1 -q)
 check "pfs ls names the commit a moving --from meant" contains "$("$PFS" ls)" "from HEAD~1 ($(git rev-parse --short=7 HEAD~1))"
 "$PFS" rm "$ova" "$ovb" "$ovc" "$frid" --force >/dev/null 2>&1
 git branch -q -D "pfs/$ova-ov-a" "pfs/$frid-ov-from" 2>/dev/null
 
 section "venvs"
-check "the fork's pip points at the fork's venv" contains "$(head -1 .forks/2/.venv/bin/pip)" "$toy/.forks/2/.venv/"
-check "activate points at the fork's venv" grep -q "$toy/.forks/2/.venv" .forks/2/.venv/bin/activate
-check "main's venv is untouched" denied grep -rq "toy/\.forks" .venv/bin
-check "python in the fork uses the fork's venv" test "$("$PFS" run 2 .venv/bin/python -c 'import sys; print(sys.prefix)')" = "$toy/.forks/2/.venv"
+check "the fork's pip points at the fork's venv" contains "$(head -1 "$forks/2/.venv/bin/pip")" "$forks/2/.venv/"
+check "activate points at the fork's venv" grep -q "$forks/2/.venv" "$forks/2/.venv/bin/activate"
+check "main's venv is untouched" denied grep -rqF "$forks" .venv/bin
+check "python in the fork uses the fork's venv" test "$("$PFS" run 2 .venv/bin/python -c 'import sys; print(sys.prefix)')" = "$forks/2/.venv"
+
+section "forks live outside the repo, one folder per main"
+repo "$mains/twin/toy"
+twin=$(cd "$mains/twin/toy" && "$PFS" new twin -q)
+twin_forks=$(cat "$mains/twin/toy/.git/pfs/forks-dir")
+check "a second main named toy gets toy-2" test "$twin_forks" = "$(real "$PFS_HOME")/forks/toy-2"
+check "  …its fork lives there" test -d "$twin_forks/$twin"
+check "  …its pfs ls sees only its own forks" test "$(cd "$mains/twin/toy" && "$PFS" ls | wc -l | tr -d ' ')" -eq "$(numbered "$twin_forks")"
+check "  …and the toy's sees only the toy's" test "$("$PFS" ls | wc -l | tr -d ' ')" -eq "$(numbered "$forks")"
+check "  …the toy's .main still names the toy" test "$(cat "$forks/.main")" = "$(real "$toy")"
+
+printf '[forks]\ndir = "%s"\n' "$mains/elsewhere" >"$PFS_HOME/config.toml"
+repo "$mains/third"
+(cd "$mains/third" && "$PFS" new t -q >/dev/null)
+check "[forks] dir sends a new main's forks there" test -d "$mains/elsewhere/third/1"
+check "  …in 0700 folders" test "$(stat -f %Lp "$mains/elsewhere" "$mains/elsewhere/third" | sort -u)" = 700
+before=$(numbered "$forks")
+kept=$("$PFS" new kept-home -q)
+check "  …while a main with forks keeps its recorded folder" test -d "$forks/$kept" -a "$(numbered "$forks")" -eq $((before + 1))
+check "  …and its record" test "$(cat .git/pfs/forks-dir)" = "$forks"
+"$PFS" rm "$kept" >/dev/null
+printf '[forks]\ndir = "forks"\n' >"$PFS_HOME/config.toml"
+check "a relative [forks] dir is an error" denied "$PFS" ls
+check "  …naming the file" contains "$("$PFS" ls 2>&1)" "[forks] dir in $PFS_HOME/config.toml"
+rm "$PFS_HOME/config.toml"
+
+repo "$mains/mover"
+moving=$(cd "$mains/mover" && "$PFS" new moving -q)
+mover_forks=$(cat "$mains/mover/.git/pfs/forks-dir")
+mv "$mains/mover" "$mains/moved"
+check "a main moved: its fork doesn't know it yet" denied contains "$(cd "$mover_forks/$moving" && "$PFS" ls 2>&1)" "* $moving-moving"
+check "  …the moved main still finds its forks" contains "$(cd "$mains/moved" && "$PFS" ls)" "$moving-moving"
+check "  …and its .main names it again" test "$(cat "$mover_forks/.main")" = "$(real "$mains/moved")"
+check "  …so the fork knows its main again" contains "$(cd "$mover_forks/$moving" && "$PFS" ls)" "* $moving-moving"
+cp -R "$mains/moved" "$mains/copy"
+check "a copy of a main doesn't take over its forks" denied contains "$(cd "$mains/copy" && "$PFS" ls)" "$moving-moving"
+check "  …and .main still names the original" test "$(cat "$mover_forks/.main")" = "$(real "$mains/moved")"
+copied=$(cd "$mains/copy" && "$PFS" new copied -q)
+check "  …its first fork gets a folder of its own" test -d "$PFS_HOME/forks/copy/$copied" -a "$(cat "$mains/copy/.git/pfs/forks-dir")" = "$(real "$PFS_HOME")/forks/copy"
+
+repo "$mains/legacy"
+mkdir -p "$mains/legacy/.forks/.rm-4"
+printf '{"type":"fork","id":6,"name":"old","branch":"pfs/6-old","ts":"2026-01-01T00:00:00.000Z"}\n{"type":"rm","id":6,"ts":"2026-01-01T00:01:00.000Z"}\n' >"$mains/legacy/.forks/ledger.jsonl"
+touch "$mains/legacy/.forks/.lock"
+last=$(jq -r 'select(.type=="fork") | .id' "$mains/legacy/.forks/ledger.jsonl" | sort -n | tail -1)
+check "an old .forks/ledger.jsonl is read" contains "$(cd "$mains/legacy" && "$PFS" ls --all)" "6-old   removed"
+check "  …from .git/pfs, where it moved" grep -q '"id":6' "$mains/legacy/.git/pfs/ledger.jsonl"
+check "  …and the old .forks is gone" test ! -e "$mains/legacy/.forks"
+check "  …the next id continues from it" contains "$(cd "$mains/legacy" && "$PFS" new next)" "created $((last + 1))-next"
+
+repo "$mains/old"
+mkdir -p "$mains/old/.forks/3"
+out=$(cd "$mains/old" && "$PFS" ls 2>&1)
+check "a leftover .forks/<n> refuses" denied sh -c "cd '$mains/old' && '$PFS' ls"
+check "  …naming it and saying to land it with pfs 0.3" contains "$out" "has forks from pfs 0.3 (3)"
+check "  …with pfs rm" contains "$out" "(\`pfs rm 3\` from"
+check "  …and leaves it be" test -d "$mains/old/.forks/3"
+
+repo "$mains/homeless"
+(cd "$mains/homeless" && env -u PFS_HOME HOME="$mains/home" "$PFS" new h >/dev/null 2>&1)
+check "with PFS_HOME unset, forks land in \$HOME/.pfs/forks" test -d "$mains/home/.pfs/forks/homeless/1"
+check "  …and the config comes from \$HOME/.pfs too" test "$(cd "$mains/homeless" && mkdir -p "$mains/home/.pfs" && printf '[ports]\nbase = 42000\n' >"$mains/home/.pfs/config.toml" && env -u PFS_HOME HOME="$mains/home" "$PFS" port 1)" = 42010
 
 section "nested repos and pipes"
-git init -q .forks/3/inner
-git -C .forks/3/inner -c user.name=t -c user.email=t@t commit -q --allow-empty -m inner
-check "a repo inside a fork is a main folder of its own" sh -c "cd .forks/3/inner && '$PFS' new deep"
-check "  …its forks live inside it" test -d .forks/3/inner/.forks/1
-check "  …while the fork itself still can't fork" denied sh -c "cd .forks/3 && '$PFS' new nope"
+inner="$forks/3/inner"
+git init -q "$inner"
+git -C "$inner" -c user.name=t -c user.email=t@t commit -q --allow-empty -m inner
+check "a repo inside a fork is a main folder of its own" sh -c "cd '$inner' && '$PFS' new deep"
+inner_forks=$(cat "$inner/.git/pfs/forks-dir")
+check "  …its forks get a folder of their own in the forks dir" test -d "$inner_forks/1" -a "$(dirname "$inner_forks")" = "$(dirname "$forks")"
+check "  …while the fork itself still can't fork" denied sh -c "cd '$forks/3' && '$PFS' new nope"
 check "  …and from inside fork 3, new/diff/rm work on it" "$PFS" run 3 sh -c "cd inner && '$PFS' new deep2 && '$PFS' diff 2 && '$PFS' rm 2"
-check "  …that fork lived inside fork 3" grep -q '"type":"rm","id":2' .forks/3/inner/.forks/ledger.jsonl
-rm -rf .forks/3/inner
+check "  …its ledger lives in its own .git/pfs" grep -q '"type":"rm","id":2' "$inner/.git/pfs/ledger.jsonl"
+(cd "$inner" && "$PFS" rm 1 --force >/dev/null)
+rm -rf "$inner"
 check "a closed pipe ends pfs quietly" test -z "$("$PFS" ls 2>&1 >/dev/null | head -1)"
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"

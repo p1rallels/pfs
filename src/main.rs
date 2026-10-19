@@ -6,6 +6,7 @@ mod config;
 mod forks;
 mod git;
 mod harness;
+mod layout;
 mod ledger;
 mod names;
 mod occupants;

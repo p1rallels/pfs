@@ -13,7 +13,6 @@ use crate::{
     place::{self, Repo},
     proc,
     runs::Kind,
-    store,
 };
 
 /// A run's command is cut to this many characters: a pi task can be pages long.
@@ -159,10 +158,10 @@ fn remove(repo: &Repo, id: u32, skipped: Skipped, look: &Look) -> Result<Removed
         bail!("{refusal}");
     }
     let saved = save_branch(repo, &fork)?;
-    let trash = repo.trash_dir(id);
-    fs::rename(&fork.dir, &trash).with_context(|| format!("can't move {} aside", fork.dir.display()))?;
+    let trash = fork.trash();
+    fs::rename(&fork.dir, &trash).with_context(|| format!("can't move {} aside", paths::tildify(&fork.dir)))?;
     {
-        let _lock = store::lock(&repo.lock())?;
+        let _lock = ledger::lock(repo)?;
         ledger::append(
             repo,
             &Event::Rm(ledger::Rm {

@@ -7,7 +7,9 @@ use clap::{Args, Parser, Subcommand};
     name = "pfs",
     version,
     about = "Forks of a folder, for you and your agents",
-    after_help = "Forks live in <repo>/.forks/<n>. Inside a fork the number is optional."
+    after_help = "Forks live outside the repo, in <forks dir>/<repo>/<n>; `pfs path <n>` prints one. \
+                  The forks dir is $PFS_HOME/forks ($PFS_HOME defaults to ~/.pfs), or [forks] dir in \
+                  $PFS_HOME/config.toml. Inside a fork the number is optional."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -25,6 +27,8 @@ pub enum Command {
     Ls(LsArgs),
     #[command(about = "Print a fork's base port (the rest of its block follows)")]
     Port(PortArgs),
+    #[command(about = "Print a fork's folder, for cd \"$(pfs path 5)\" and editors")]
+    Path(PathArgs),
     #[command(about = "Open a shell in a fork, $PORT set (exit to leave)")]
     Open(OpenArgs),
     #[command(about = "Run a command in a fork, $PORT set")]
@@ -100,6 +104,12 @@ pub struct LsArgs {
 
 #[derive(Debug, Args)]
 pub struct PortArgs {
+    #[arg(value_name = "N", help = "Fork number; defaults to the fork you're in")]
+    pub fork: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct PathArgs {
     #[arg(value_name = "N", help = "Fork number; defaults to the fork you're in")]
     pub fork: Option<String>,
 }
@@ -252,6 +262,17 @@ mod tests {
         assert_eq!(args.targets, ["5", "6.2"]);
         assert_eq!(args.timeout, Some(3));
         assert!(wait(&[]).unwrap().targets.is_empty());
+    }
+
+    #[test]
+    fn path_takes_an_optional_fork() {
+        let path = |argv: &[&str]| match Cli::try_parse_from(["pfs", "path"].iter().chain(argv)).ok()?.command {
+            Command::Path(args) => Some(args.fork),
+            _ => None,
+        };
+        assert_eq!(path(&["5"]), Some(Some("5".to_string())));
+        assert_eq!(path(&[]), Some(None));
+        assert_eq!(path(&["5", "6"]), None);
     }
 
     #[test]

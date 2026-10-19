@@ -1,14 +1,14 @@
-//! `.forks/ledger.jsonl`: every fork that ever existed and its removal.
-//! Append-only, under the forks' lock, so two `pfs new` at once never share
-//! a number. Lines of a type pfs no longer writes (an old `allow`) read as
-//! `Unknown` and change nothing.
+//! `<main>/.git/pfs/ledger.jsonl`: every fork that ever existed and its
+//! removal. Append-only, under its lock, so two `pfs new` at once never
+//! share a number. Lines of a type pfs no longer writes (an old `allow`)
+//! read as `Unknown` and change nothing.
 
-use std::{collections::BTreeMap, fs};
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::{names, place::Repo, place::parse_dir_id, store};
+use crate::{layout, names, paths, place::Repo, place::parse_dir_id, store};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -81,6 +81,10 @@ pub fn append(repo: &Repo, event: &Event) -> Result<()> {
     store::append(&repo.ledger(), event)
 }
 
+pub fn lock(repo: &Repo) -> Result<store::Lock> {
+    layout::lock(&repo.root)
+}
+
 pub fn fold(events: Vec<Event>) -> Ledger {
     events.into_iter().fold(BTreeMap::new(), |mut ledger, event| {
         match event {
@@ -98,20 +102,17 @@ pub fn fold(events: Vec<Event>) -> Ledger {
     })
 }
 
-/// Numbered fork folders on disk, including ones being deleted (`.rm-<n>`).
-pub fn ids_on_disk(repo: &Repo) -> Vec<u32> {
-    fs::read_dir(repo.forks())
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| {
-                    let name = entry.file_name();
-                    let name = name.to_str()?;
-                    parse_dir_id(name.strip_prefix(".rm-").unwrap_or(name))
-                })
-                .collect()
-        })
+/// Numbered fork folders in a forks folder, including ones being deleted
+/// (`.rm-<n>`).
+pub fn ids_on_disk(forks: &Path) -> Vec<u32> {
+    paths::entries(forks)
         .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.file_name()?.to_str()?;
+            parse_dir_id(name.strip_prefix(".rm-").unwrap_or(name))
+        })
+        .collect()
 }
 
 #[cfg(test)]

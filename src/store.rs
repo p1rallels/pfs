@@ -10,12 +10,13 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 
-/// Every parseable line, in order. A missing file is an empty log.
+/// Every parseable line, in order. A missing file is an empty log, and so
+/// is one under a `.git` that's a file (a worktree's).
 /// Lines that don't parse (a crash mid-write, a newer pfs) are skipped.
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(Vec::new()),
         Err(error) => return Err(error).with_context(|| format!("can't read {}", path.display())),
     };
     Ok(text

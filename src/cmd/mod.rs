@@ -3,6 +3,7 @@ mod logs;
 mod ls;
 mod new;
 mod open;
+mod path;
 mod port;
 mod rm;
 mod run;
@@ -18,6 +19,7 @@ pub fn dispatch(command: Command) -> Result<i32> {
         Command::New(args) => new::run(args),
         Command::Ls(args) => ls::run(args),
         Command::Port(args) => port::run(args),
+        Command::Path(args) => path::run(args),
         Command::Open(args) => open::run(args),
         Command::Run(args) => run::run(args),
         Command::Logs(args) => logs::run(args),

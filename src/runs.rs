@@ -1,4 +1,4 @@
-//! `.forks/<n>/.git/pfs/runs.jsonl`: what ran in one fork. It lives inside
+//! `<fork>/.git/pfs/runs.jsonl`: what ran in one fork. It lives inside
 //! the fork, in `.git` where git never tracks anything (an agent's
 //! `git add -A` can't commit it), and it's deleted along with the fork.
 

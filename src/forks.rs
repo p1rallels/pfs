@@ -2,7 +2,6 @@
 
 use std::{
     ffi::OsString,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -49,11 +48,16 @@ impl Fork {
     pub fn base(&self) -> Option<&str> {
         self.entry.as_ref().and_then(|entry| entry.fork.base.as_deref())
     }
+
+    /// Where `pfs rm` moves the folder before deleting it: next to it, in
+    /// the same forks folder.
+    pub fn trash(&self) -> PathBuf {
+        self.dir.with_file_name(format!(".rm-{}", self.id))
+    }
 }
 
 pub fn require(repo: &Repo, ledger: &Ledger, id: u32) -> Result<Fork> {
-    let dir = repo.fork_dir(id);
-    if dir.is_dir() {
+    if let Some(dir) = repo.fork_dir(id).filter(|dir| dir.is_dir()) {
         return Ok(Fork {
             id,
             dir,
@@ -73,31 +77,35 @@ pub fn require(repo: &Repo, ledger: &Ledger, id: u32) -> Result<Fork> {
     }
 }
 
+/// What's in the repo's forks folder; nothing before its first fork.
+fn listing(repo: &Repo) -> Vec<PathBuf> {
+    repo.forks
+        .as_deref()
+        .map(|forks| paths::entries(forks).unwrap_or_default())
+        .unwrap_or_default()
+}
+
 /// Fork folders that exist right now.
 pub fn active_ids(repo: &Repo) -> Vec<u32> {
-    let mut ids: Vec<u32> = fs::read_dir(repo.forks())
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|entry| entry.path().is_dir())
-                .filter_map(|entry| entry.file_name().to_str().and_then(parse_dir_id))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut ids: Vec<u32> = listing(repo)
+        .iter()
+        .filter(|path| path.is_dir())
+        .filter_map(|path| path.file_name()?.to_str().and_then(parse_dir_id))
+        .collect();
     ids.sort_unstable();
     ids
 }
 
 /// Finishes deletions an earlier `pfs rm` couldn't (best effort).
 pub fn sweep_trash(repo: &Repo) {
-    let Ok(entries) = fs::read_dir(repo.forks()) else {
-        return;
-    };
-    entries
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".rm-"))
-        .for_each(|entry| {
-            let _ = paths::remove_tree(&entry.path());
+    listing(repo)
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".rm-"))
+        })
+        .for_each(|path| {
+            let _ = paths::remove_tree(path);
         });
 }
 
@@ -240,19 +248,22 @@ mod tests {
     fn a_job_runs_where_you_are_in_your_fork_and_at_the_root_of_any_other() {
         let repo = Repo {
             root: PathBuf::from("/r"),
+            forks: Some(PathBuf::from("/f/r")),
         };
         let place = Place {
             fork: Some(3),
-            cwd: repo.fork_dir(3).join("src"),
+            cwd: PathBuf::from("/f/r/3/src"),
             repo: repo.clone(),
         };
         let config = Global {
             ports: crate::ports::Plan::default(),
+            forks_dir: PathBuf::from("/f"),
+            path: PathBuf::from("/p/config.toml"),
         };
         let job = |id: u32| {
             let fork = Fork {
                 id,
-                dir: repo.fork_dir(id),
+                dir: repo.fork_dir(id).unwrap(),
                 entry: None,
             };
             let plan = Plan {
@@ -263,13 +274,23 @@ mod tests {
             job(&place, &config, &fork, plan)
         };
         let own = job(3);
-        assert_eq!((own.cwd, own.port), (PathBuf::from("/r/.forks/3/src"), 40030));
+        assert_eq!((own.cwd, own.port), (PathBuf::from("/f/r/3/src"), 40030));
         let other = job(5);
         assert_eq!(
             (other.fork_dir, other.cwd, other.port),
-            (PathBuf::from("/r/.forks/5"), PathBuf::from("/r/.forks/5"), 40050)
+            (PathBuf::from("/f/r/5"), PathBuf::from("/f/r/5"), 40050)
         );
         assert_eq!(other.argv, vec![OsString::from("true")]);
+    }
+
+    #[test]
+    fn the_trash_sits_next_to_the_fork() {
+        let fork = Fork {
+            id: 5,
+            dir: PathBuf::from("/f/r/5"),
+            entry: None,
+        };
+        assert_eq!(fork.trash(), PathBuf::from("/f/r/.rm-5"));
     }
 
     #[test]

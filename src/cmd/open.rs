@@ -17,7 +17,7 @@ pub fn run(args: OpenArgs) -> Result<i32> {
     launch(&place, id)
 }
 
-/// The door: your shell in the fork with $PORT set. Like `cd .forks/<n>`
+/// The door: your shell in the fork with $PORT set. Like `cd "$(pfs path <n>)"`
 /// plus $PORT, and nothing else: what you run in there is yours, and the door
 /// knows nothing about it.
 pub fn launch(place: &Place, id: u32) -> Result<i32> {

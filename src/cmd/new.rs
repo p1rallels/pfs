@@ -11,11 +11,11 @@ use crate::{
     clock, clone,
     config::{self, Global},
     forks::{self, START_REF},
-    git, harness,
+    git, harness, layout,
     ledger::{self, Event, Ledger},
     names, paths,
-    place::{self, FORKS_DIR, Place, Repo, parse_fork_ref},
-    ports, runs, store, venv,
+    place::{self, Place, Repo, parse_fork_ref},
+    ports, runs, venv,
 };
 
 /// What populate made: the venvs it re-pointed, the base commit, and main's
@@ -55,6 +55,7 @@ pub fn run(args: NewArgs) -> Result<i32> {
             place.repo.root.display()
         );
     }
+    refuse_stray_fork(&place.repo.root)?;
     let repo = place.repo.clone();
     require_plain_repo(&repo)?;
     if let Some(raw) = args.name.as_deref() {
@@ -65,14 +66,20 @@ pub fn run(args: NewArgs) -> Result<i32> {
     let ledger = ledger::load(&repo)?;
     let source = source(&repo, &ledger, &args)?;
 
-    prepare(&repo)?;
-    let id = claim(&repo)?;
+    let home = settle(&repo, &config)?;
+    let repo = Repo {
+        forks: Some(home.clone()),
+        ..repo
+    };
+    forks::sweep_trash(&repo);
+    let id = claim(&repo, &home)?;
     let branch = names::branch(id, name.as_deref());
-    let fork_dir = repo.fork_dir(id);
+    let fork_dir = place::fork_in(&home, id);
     let Made { venvs, base, carried } = match populate(&repo, &fork_dir, &branch, &source) {
         Ok(made) => made,
         Err(error) => {
             let _ = paths::remove_tree(&fork_dir);
+            let error = other_disk(error, &repo.root, &home, &config);
             return Err(error.context(format!("couldn't create fork {id}")));
         }
     };
@@ -91,7 +98,8 @@ pub fn run(args: NewArgs) -> Result<i32> {
         ts: clock::now(),
     };
     record(&repo, fork)?;
-    let created = created_line(&place, &config, id, name.as_deref(), &branch);
+    let place = Place { repo, ..place };
+    let created = created_line(&place, &config, &fork_dir, id, name.as_deref(), &branch);
     let notes: Vec<String> = name_note(id, args.name.as_deref(), name.as_deref())
         .into_iter()
         .chain(source_notes(&ledger, &source))
@@ -105,6 +113,21 @@ pub fn run(args: NewArgs) -> Result<i32> {
     match args.open {
         true => open::launch(&place, id),
         false => Ok(0),
+    }
+}
+
+/// A repo in a forks folder whose main doesn't claim it: a fork of a main
+/// that moved, until a pfs command there signs the folder again. Forking it
+/// would nest forks.
+fn refuse_stray_fork(root: &Path) -> Result<()> {
+    match root.parent().and_then(layout::main_named) {
+        Some(main) => bail!(
+            "forks are flat: {} is in the forks folder of {}, which doesn't claim it now (moved?). \
+             a pfs command in that main folder, wherever it is now, claims its forks again",
+            paths::tildify(root),
+            paths::tildify(&main)
+        ),
+        None => Ok(()),
     }
 }
 
@@ -186,32 +209,40 @@ fn removed_fork_branch(ledger: &Ledger, rev: &str) -> Option<anyhow::Error> {
     ))
 }
 
-fn prepare(repo: &Repo) -> Result<()> {
-    let forks = repo.forks();
-    if forks.exists() && !forks.is_dir() {
-        bail!("{} exists and isn't a folder", forks.display());
+/// The forks folder this fork goes in: the main's own, or a new one in the
+/// forks dir on its first fork. Under the ledger lock, so two first
+/// `pfs new` at once settle on one.
+fn settle(repo: &Repo, config: &Global) -> Result<PathBuf> {
+    let _lock = ledger::lock(repo)?;
+    layout::home_for_new(&repo.root, config)
+}
+
+/// clonefile's EXDEV, in pfs's terms: what to change so clones work.
+fn other_disk(error: anyhow::Error, root: &Path, home: &Path, config: &Global) -> anyhow::Error {
+    match error.chain().any(|cause| cause.is::<clone::OtherDisk>()) {
+        true => anyhow!(
+            "{}",
+            layout::other_disk(root, home.parent().unwrap_or(home), &config.path)
+        ),
+        false => error,
     }
-    fs::create_dir_all(&forks).with_context(|| format!("can't create {}", forks.display()))?;
-    git::exclude(&repo.root, &format!("/{FORKS_DIR}/"))?;
-    forks::sweep_trash(repo);
-    Ok(())
 }
 
 /// Picks the next number and claims it by creating the folder, under the
 /// ledger lock so two `pfs new` at once never share a number. Numbers are
 /// never reused: removed forks stay in the ledger and their saved branches
 /// stay in git.
-fn claim(repo: &Repo) -> Result<u32> {
-    let _lock = store::lock(&repo.lock())?;
+fn claim(repo: &Repo, home: &Path) -> Result<u32> {
+    let _lock = ledger::lock(repo)?;
     let recorded = ledger::load(repo)?.keys().max().copied().unwrap_or(0);
-    let on_disk = ledger::ids_on_disk(repo).into_iter().max().unwrap_or(0);
+    let on_disk = ledger::ids_on_disk(home).into_iter().max().unwrap_or(0);
     let saved = git::branches(&repo.root, "pfs/")
         .iter()
         .filter_map(|branch| names::id_from_branch(branch))
         .max()
         .unwrap_or(0);
     let id = recorded.max(on_disk).max(saved) + 1;
-    let dir = repo.fork_dir(id);
+    let dir = place::fork_in(home, id);
     fs::create_dir(&dir).with_context(|| format!("can't create {}", dir.display()))?;
     Ok(id)
 }
@@ -220,7 +251,7 @@ fn claim(repo: &Repo) -> Result<u32> {
 /// record of where it started. Every git command here runs in the new fork.
 fn populate(repo: &Repo, fork_dir: &Path, branch: &str, source: &Source) -> Result<Made> {
     let from = source.dir(repo);
-    clone::tree(from, fork_dir, &[FORKS_DIR])?;
+    clone::tree(from, fork_dir, &[layout::LEGACY])?;
     reset_pfs_state(fork_dir)?;
     let venvs = venv::relocate(from, fork_dir)?;
     let base = start_branch(fork_dir, branch, source)?;
@@ -283,7 +314,7 @@ fn reset_pfs_state(fork_dir: &Path) -> Result<()> {
 }
 
 fn record(repo: &Repo, fork: ledger::Fork) -> Result<()> {
-    let _lock = store::lock(&repo.lock())?;
+    let _lock = ledger::lock(repo)?;
     ledger::append(repo, &Event::Fork(fork))
 }
 
@@ -297,9 +328,9 @@ fn split_output(quiet: bool, id: u32, created: String, notes: Vec<String>) -> (V
     }
 }
 
-fn created_line(place: &Place, config: &Global, id: u32, name: Option<&str>, branch: &str) -> String {
+fn created_line(place: &Place, config: &Global, dir: &Path, id: u32, name: Option<&str>, branch: &str) -> String {
     let label = names::label(id, name);
-    let path = forks::show_path(&place.repo.fork_dir(id), place);
+    let path = forks::show_path(dir, place);
     let ports = ports::show(config.ports.block(id));
     format!("created {label} at {path} (branch {branch}, ports {ports})")
 }

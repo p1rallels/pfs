@@ -14,8 +14,10 @@ use std::{
 
 use anyhow::{Context, Result};
 
+use crate::layout;
+
 const MAX_FILE: u64 = 1024 * 1024;
-const SKIP_DIRS: &[&str] = &[".git", "node_modules", ".forks"];
+const SKIP_DIRS: &[&str] = &[".git", "node_modules", layout::LEGACY];
 
 /// Rewrites every in-repo venv of the fork; returns the venvs it fixed.
 pub fn relocate(root: &Path, fork_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -217,7 +219,7 @@ mod tests {
     fn relocates_a_fake_venv() {
         let base = std::env::temp_dir().join(format!("pfs-venv-test-{}", std::process::id()));
         let root = base.join("repo");
-        let fork = root.join(".forks").join("1");
+        let fork = base.join("forks").join("repo").join("1");
         let bin = fork.join(".venv").join("bin");
         fs::create_dir_all(&bin).unwrap();
         fs::write(fork.join(".venv").join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
