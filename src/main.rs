@@ -3,6 +3,7 @@ mod clock;
 mod clone;
 mod cmd;
 mod config;
+mod everywhere;
 mod forks;
 mod git;
 mod harness;
