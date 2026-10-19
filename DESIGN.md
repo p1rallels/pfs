@@ -2,13 +2,13 @@
 
 forks of a folder, for you and your agents. `pfs` gives a repo instant, private copies of itself, each on its own branch with its own ports, so the same codebase can be worked on in several places at once, by hand or by subagents, without worktrees, vms or setup scripts.
 
-status: v0.3 (session `01a13e1f`): the walls are gone (m-1a56). pfs is folders, branches, ports and runs, and the rules are words in AGENTS.md. `pfs rm` refuses while anyone works in a fork: a process with its folder there, a harness conversation mid-turn, or uncommitted work (m-9df3, with m-4de7's door hints). built with pfs: two subs in parallel (the teardown; a standalone "who's working here" module), then a third wired it into rm and, with no walls left, ran the end-to-end script inside its own fork. `sandbox/hammer.sh` = 221 checks green. v0.2 (session `01a13d07`): pfs is for every harness. `--agent` is gone: a sub is `n=$(pfs new x -q) && pfs run "$n" --bg pi -p "<task>"`, `pfs ls` says how the last bg run ended, the brief's rules are words in AGENTS.md, and the harness table (`src/harness.rs`) is the only place pfs knows a harness. v0.1 built, hammered and dogfooded (session `01a13c14`): the door, `--of`, `--from` a live fork's branch, rm's merge note, then built with pfs itself: `pfs wait`, `pfs rm` with several forks, `pfs ls` work columns and `--overlap`, per-file "uncommitted". the orchestration loop is a pi skill: `skills/pfs/SKILL.md`. dogfooded on a private github repo (`p1rallels/pfs-demo`) with real pi subs, a fan-in with a real conflict, and a push. v0 (session `01a13b3e`): every v0 command, waiters, the ledger, venv relocation, and the wall (history below). the threat model, signing, and the git design: sessions `01a13b9f`, `01a13baf`. origins (as `git fork`): pi sessions `01a13236`, `01a133b3`. this design: `01a138e1`. use `lookup catchup <id>` for the reasoning behind any decision.
+status: v0.4 (session `01a150cf`): forks live outside the repo, in `<forks dir>/<repo>/<n>` (`~/.pfs/forks` by default, m-dcbb), so nothing run from the main folder walks into them and `git clean` can't reach them or the ledger. `sandbox/interop.sh` reads 0 for every formatter, linter and test runner run from main, with no setting in any of them. `pfs path <n>` prints a fork's folder, and `pfs ls` outside any repo lists every main's forks, flagging the ones whose main is gone. built with pfs: one sub for the layout, one in parallel for the every-repo listing as an unwired module, wired at fan-in. `sandbox/hammer.sh` = 276 checks green. v0.3 (session `01a13e1f`): the walls are gone (m-1a56). pfs is folders, branches, ports and runs, and the rules are words in AGENTS.md. `pfs rm` refuses while anyone works in a fork: a process with its folder there, a harness conversation mid-turn, or uncommitted work (m-9df3, with m-4de7's door hints). built with pfs: two subs in parallel (the teardown; a standalone "who's working here" module), then a third wired it into rm and, with no walls left, ran the end-to-end script inside its own fork. `sandbox/hammer.sh` = 221 checks green. v0.2 (session `01a13d07`): pfs is for every harness. `--agent` is gone: a sub is `n=$(pfs new x -q) && pfs run "$n" --bg pi -p "<task>"`, `pfs ls` says how the last bg run ended, the brief's rules are words in AGENTS.md, and the harness table (`src/harness.rs`) is the only place pfs knows a harness. v0.1 built, hammered and dogfooded (session `01a13c14`): the door, `--of`, `--from` a live fork's branch, rm's merge note, then built with pfs itself: `pfs wait`, `pfs rm` with several forks, `pfs ls` work columns and `--overlap`, per-file "uncommitted". the orchestration loop is a pi skill: `skills/pfs/SKILL.md`. dogfooded on a private github repo (`p1rallels/pfs-demo`) with real pi subs, a fan-in with a real conflict, and a push. v0 (session `01a13b3e`): every v0 command, waiters, the ledger, venv relocation, and the wall (history below). the threat model, signing, and the git design: sessions `01a13b9f`, `01a13baf`. origins (as `git fork`): pi sessions `01a13236`, `01a133b3`. this design: `01a138e1`. use `lookup catchup <id>` for the reasoning behind any decision.
 
 ## invariants
 
 what dogfooding checks against. each one has hammer checks.
 
-- **a fork is a folder, and the rules are words.** everything pfs starts in fork n starts in `.forks/n` with `$PORT`. nothing stops it writing elsewhere: AGENTS.md asks agents to write only inside their fork, commit on their branch, use `$PORT` and not push, and they do.
+- **a fork is a folder, and the rules are words.** everything pfs starts in fork n starts in its folder (`pfs path n`) with `$PORT`. nothing stops it writing elsewhere: AGENTS.md asks agents to write only inside their fork, commit on their branch, use `$PORT` and not push, and they do.
 - **rm never loses work.** it refuses while anyone works in the fork (a process with its folder there, a pfs run still going, a harness conversation mid-turn) and while there's uncommitted work; `--force` skips only the last two. it never kills anything, and it lands the fork's branch in main as `pfs/<n>-<name>` before deleting the folder. rm is the only way work reaches main; nothing of the fork's settings comes along.
 - **forks never push.** etiquette, not enforced: a fork has main's `origin`, your credentials and the network. you push from main.
 - **git settings flow one way:** main → a new fork, at creation. a fork may change its own; rm brings back only the branch.
@@ -42,25 +42,37 @@ pfs is forks first. the main use is you driving several forks of one repo, one t
 ## layout
 
 ```
-<repo>/
-  .forks/              hidden from git via .git/info/exclude
-    ledger.jsonl       every fork that ever existed: created, removed
-    5/                 fork 5: a full apfs clone of the repo
-      .git/pfs/
-        runs.jsonl     what ran in fork 5: starts and exits
-        1.log          output of fork 5's first background run
-        2.log
+~/.pfs/                   $PFS_HOME: pfs's one home
+  config.toml              [ports], [forks] dir
+  forks/                   the forks dir ([forks] dir moves it)
+    pfs-cli/               one folder per main, named after it (pfs-cli-2 on a clash), 0700
+      .main                the main's path: whose forks these are
+      README.md            a sign: remove with pfs rm from the main, never by hand
+      5/                   fork 5: a full apfs clone of the main
+        .git/pfs/
+          runs.jsonl       what ran in fork 5: starts and exits
+          1.log            output of fork 5's first background run
+<repo>/.git/pfs/
+  forks-dir                this main's forks folder: the record wins over [forks] dir
+  ledger.jsonl             every fork that ever existed: created, removed
+  ledger.lock
 ```
 
-- forks live under the repo, so they're always on the same disk (clones only work within one volume) and everything about a repo stays with it.
-- a fork clones each top-level entry except `.forks/`. cloning the whole folder would copy old forks into the new one.
-- `.forks/` goes in `.git/info/exclude`, never committed. a tool that reads `.gitignore` but not `info/exclude` sees every fork as more of the repo: cm did (one fork doubled its index, every query hit came back twice) until codemapper 5bf74b8. from inside a fork, the fork's own `.git` stops main's excludes, so cm there sees the fork.
-- tools that walk into dot-folders and read neither `info/exclude` nor any ignore file see forks too, and from main their `--write`/`--fix` rewrites files inside every fork: prettier and black (read `.gitignore` only), eslint, biome (unless its git integration is on), jest, vitest, isort. `bun test`, `node --test`, tsc, ruff, pytest, mypy, rg, fd and cm leave forks alone. pfs can't fix it from its side: a `.forks/.gitignore` of `*` changed nothing for any of them, and only prettier and black read the repo's `.gitignore`. so it's words: each tool's own ignore setting, in README.md, checked by `sandbox/interop.sh`.
+- **why outside the repo** (v0.4, m-45bc then m-dcbb): in `<repo>/.forks/`, prettier, eslint, biome, jest, vitest, black and isort run from main formatted, linted and tested every fork, and their `--write`/`--fix` rewrote the forks' work in progress. docker's build context, tar and rsync took forks along, and `git clean -fdx` deleted the ledger (`-ffdx` every fork). no tool-agnostic fix existed: tools share no ignore file (some read `info/exclude`, prettier and black only `.gitignore`, the rest only their own config), and the names everyone skips (`.git`, `node_modules`) are matched on absolute paths by tools inside the fork: jest found no tests in a fork under `.git/`. outside the repo, `sandbox/interop.sh` reads 0 from main for all 18 tools with no setting, and the write modes change nothing in the forks.
+- **same disk:** clones only work within one volume, so before a main's first fork pfs checks the repo and the forks dir share one. if not, one error says to set `[forks] dir` to a folder on the repo's disk. no fallback.
+- **one folder per main, not one flat folder:** a `..` slip from a fork stays inside its own main's forks. a main is never above a fork: in `.forks/5`, `../..` was the main itself.
+- **0700:** pfs makes `$PFS_HOME`, the forks dir and every per-main folder private. forks carry `.env`, and `~` is often 750 while `~/Desktop` is 700.
+- **the record wins:** `[forks] dir` only places a main's first forks folder. the main records it in `.git/pfs/forks-dir`, so changing the setting never strands forks.
+- **the ledger lives in the main's `.git/pfs/`:** git never tracks `.git`, no tool walks it, `git clean` can't reach it, and it moves with the repo. `new` wipes `.git/pfs` from every clone, so no fork carries it.
+- **moved and copied mains:** a moved main signs its folder again (`.main`) on its next pfs command; until then its forks act as mains of their own. a copy never takes over the original's forks: its first `new` gets a folder of its own.
+- **orphans:** a deleted main leaves its forks behind. `pfs ls` outside any repo lists every main's forks and flags the ones whose main is gone or replaced, with each fork's work and how to keep or drop it. pfs never deletes them.
+- **from 0.3:** the first command in a main moves `.forks/ledger.jsonl` into `.git/pfs/` (ids carry on) and removes the emptied `.forks/`. a main that still has 0.3 forks (`.forks/<n>`) is refused until they're landed with 0.3's `pfs rm`. the config moves by hand, from `~/.config/pfs/config.toml` to `~/.pfs/config.toml`.
+- a fork clones each top-level entry except `.forks/`, so a 0.3 leftover never rides along.
 - a fork's runs live inside it, in its `.git/pfs/`, so they go with the fork. git never tracks anything in `.git`, so an agent's `git add -A` can't commit logs and no exclude entry is needed (same trick git-lfs uses with `.git/lfs`). `pfs rm` deletes them with the folder.
 
 ## forks
 
-- **ids:** sequential per repo, from 1, never reused, unlimited. pi files sessions by folder path, so a reused `.forks/5` would inherit the old fork 5's conversations, and its saved `pfs/5-…` branch would collide.
+- **ids:** sequential per repo, from 1, never reused, unlimited. pi files sessions by folder path, so a reused fork folder would inherit the old fork 5's conversations, and its saved `pfs/5-…` branch would collide.
 - **names:** `pfs new add-csv` → fork `8-add-csv`, branch `pfs/8-add-csv`. no name → `pfs/8`. pfs picks the number: a leading `<number>-` in the name is stripped and the final name echoed (`pfs new 7-add-csv` → "created 8-add-csv"). the one casualty is a name like `404-page`. a bare number is an error: `pfs new 5` reads like "a fork of 5" or a slip for `pfs open 5`, and would have made a fork labelled `9-5`. the error points at `--of 5` and `pfs open 5`.
 - **refer by number:** `pfs open 8`, `pfs rm 8`. the name is a label.
 - **three starts, pick one:**
@@ -74,11 +86,12 @@ pfs is forks first. the main use is you driving several forks of one repo, one t
 
 no env vars for identity. pfs walks up from the current folder to the nearest repo root (the closest folder with a `.git`):
 
-- **fork id:** if that root is `<repo>/.forks/<n>`, you're in fork n. otherwise it's a main folder
-- **ledger:** `<repo>/.forks/ledger.jsonl`
+- **fork id:** if that root is `<folder>/<n>` and `<folder>/.main` names a main whose `.git/pfs/forks-dir` names `<folder>` back, you're in fork n of that main. otherwise it's a main folder
+- **ledger:** `<main>/.git/pfs/ledger.jsonl`
 - a repo nested inside a fork (a test fixture like `sandbox/work/toy` in a fork of pfs-cli) is a main folder of its own. "outermost `.forks/<n>` in the path" broke exactly that, i.e. pfs building pfs
+- a 0.3 fork (`<main>/.forks/<n>`) is refused, so `pfs new` there can't make it a main
 
-the path can't go stale, unlike an inherited env var. agents see it too: pi puts the working folder in the system prompt, and pi's footer shows the git branch (`pfs/8-add-csv`) for free.
+the path can't go stale, unlike an inherited env var (a moved main re-signs `.main` on its next command). agents see it too: pi puts the working folder in the system prompt, and pi's footer shows the git branch (`pfs/8-add-csv`) for free.
 
 forks and sessions are different things:
 
@@ -111,7 +124,7 @@ until v0.3, every process pfs started in a fork ran inside a macos seatbelt prof
 - **nothing core needed it.** forks, branches, `$PORT`, the ledger, runs and their waiters, `new`/`ls`/`wait`/`diff`/`run`/`open`/`rm`, `--of`/`--from`, overlap and rm's merge note all stand on their own.
 - **and it cost:** an allow-list per toolchain and per harness with a command to manage it, a git settings lock, pfs's own git wrapped in walls, gpg-agent warm-ups, a shell-history exception for the door, and "walls can't stack": no end-to-end script inside a fork, nothing from inside one fork into another.
 
-what's left are the places pfs owns: a fork is a folder (`.forks/<n>`) with a branch, a port block and a record of what ran there. from inside a fork, `pfs run`, `pfs diff` and `pfs open` into another fork just work, `pfs ls` checks every fork's work, and `sandbox/hammer.sh` runs anywhere. old data still reads: the ledger's `allow` lines are skipped, `[wall]` tables in `~/.config/pfs/config.toml` are ignored, and a repo's `.pfs.toml` isn't read at all.
+what's left are the places pfs owns: a fork is a folder (`<forks dir>/<repo>/<n>`) with a branch, a port block and a record of what ran there. from inside a fork, `pfs run`, `pfs diff` and `pfs open` into another fork just work, `pfs ls` checks every fork's work, and `sandbox/hammer.sh` runs anywhere. old data still reads: the ledger's `allow` lines are skipped, `[wall]` tables in `~/.config/pfs/config.toml` are ignored, and a repo's `.pfs.toml` isn't read at all.
 
 ### git in a fork
 
@@ -125,7 +138,7 @@ a fork's `.git` is a full copy of main's (history, branches, settings, hooks), n
 
 one line per thing that happened, only ever appended, never erased. same idea as a pi session file. two files:
 
-**`.forks/ledger.jsonl`, the forks.** written by `new` and `rm`, which run from the main folder.
+**`<main>/.git/pfs/ledger.jsonl`, the forks.** written by `new` and `rm`, which run from the main folder.
 
 ```jsonl
 {"type":"fork","id":8,"name":"add-csv","branch":"pfs/8-add-csv","base":"a1b2c3d","parent_session":"01a138e1…","ts":"…"}
@@ -133,7 +146,7 @@ one line per thing that happened, only ever appended, never erased. same idea as
 {"type":"rm","id":8,"saved_branch":"pfs/8-add-csv","ts":"…"}
 ```
 
-**`.forks/8/.git/pfs/runs.jsonl`, the runs inside one fork.** written by the waiter (or by pfs itself for a foreground run), whether the run was started from the main folder or from inside the fork.
+**`<fork 8>/.git/pfs/runs.jsonl`, the runs inside one fork.** written by the waiter (or by pfs itself for a foreground run), whether the run was started from the main folder or from inside the fork.
 
 ```jsonl
 {"type":"start","run":1,"kind":"bg","cmd":"pi -p fix the csv export","pid":4242,"ts":"…"}
@@ -155,15 +168,15 @@ everything pfs starts in a fork gets the fork as its folder, `$PORT`, and a line
 
 ### the door
 
-`pfs open 5` is `cd .forks/5` plus `$PORT`: your `$SHELL` in the fork, one line saying where you are (`fork 5-csv · branch pfs/5-csv · ports 40050-40059 · exit to leave`). `exit` brings you back. what you run in there is yours: `pi`, `pi -c`, `pi -r`, an editor. a fork is a folder, and the conversations in it are the harness's: pfs doesn't pick one for you. `pfs new --open` makes a fork and walks you in.
+`pfs open 5` is `cd "$(pfs path 5)"` plus `$PORT`: your `$SHELL` in the fork, one line saying where you are (`fork 5-csv · branch pfs/5-csv · ports 40050-40059 · exit to leave`). `exit` brings you back. what you run in there is yours: `pi`, `pi -c`, `pi -r`, an editor. a fork is a folder, and the conversations in it are the harness's: pfs doesn't pick one for you. `pfs new --open` makes a fork and walks you in.
 
 - **something still running:** the door lists what pfs has running in the fork (from its run records: `5.1 bg (pid 4242)`), so you don't walk in on an agent's work unawares. nothing about conversations: the door knows nothing about pi, by design.
 - **recorded:** the door is an `open` run, so `pfs ls` shows it (`open 5m`) and `pfs rm` won't pull the folder out from under it: it says "exit that shell", or "that's the door you're in" when rm is typed inside it.
-- **nothing added:** a pi you start in the door is a plain pi, like a sub's: no fork line, no extra prompt. it sees the folder (`.forks/5`) and the branch in its footer like anywhere else, and AGENTS.md says the rest.
-- **cd vs the door:** `cd .forks/5` works too. the door adds `$PORT` and the record.
+- **nothing added:** a pi you start in the door is a plain pi, like a sub's: no fork line, no extra prompt. it sees the folder (`~/.pfs/forks/<repo>/5`) and the branch in its footer like anywhere else, and AGENTS.md says the rest.
+- **cd vs the door:** `cd "$(pfs path 5)"` works too. the door adds `$PORT` and the record.
 
-- **foreground (default):** `pfs run 3 cargo test`. output goes straight to your terminal, and pfs exits with the command's exit code. it's `cd .forks/3 && cargo test`, minus the cd, plus `$PORT` and the record.
-- **background:** `pfs run 5 --bg bun dev`. returns at once. each run gets a number in its fork (`5.1`, `5.2`), so several runs per fork never mix. output → `.forks/5/.git/pfs/1.log`. no cap, no trimming. deleted with the fork.
+- **foreground (default):** `pfs run 3 cargo test`. output goes straight to your terminal, and pfs exits with the command's exit code. it's `cd "$(pfs path 3)" && cargo test`, minus the cd, plus `$PORT` and the record.
+- **background:** `pfs run 5 --bg bun dev`. returns at once. each run gets a number in its fork (`5.1`, `5.2`), so several runs per fork never mix. output → `<fork 5>/.git/pfs/1.log`. no cap, no trimming. deleted with the fork.
 - **from inside a fork, the number is optional:** `pfs run --bg bun dev`. the path says which fork. any other fork's number works too.
 
 ### the waiter
@@ -171,7 +184,7 @@ everything pfs starts in a fork gets the fork as its folder, `$PORT`, and a line
 background runs (agents included) get a tiny waiter process. macos hands a finished program's exit code only to its parent, so something has to be waiting to write "exited 1 at 14:32" down. roughly:
 
 ```sh
-# in .forks/5/
+# in fork 5's folder
 sh -c 'bun dev > .git/pfs/1.log 2>&1; echo "{\"type\":\"exit\",\"run\":1,\"code\":$?}" >> .git/pfs/runs.jsonl'
 ```
 
@@ -199,7 +212,7 @@ n=$(pfs new add-csv -q) && pfs run "$n" --bg pi -p "add a csv export for balance
 
 ### forks are flat
 
-- no forks inside forks. every fork lives in the main folder's `.forks/`. need more hands? make more forks from the main folder. a fork *of* a fork is fine (`--of 5`): flat folder, lineage in the ledger.
+- no forks inside forks. every fork lives in its main's forks folder. need more hands? make more forks from the main folder. a fork *of* a fork is fine (`--of 5`): flat folder, lineage in the ledger.
 - `pfs new` inside a fork fails: "forks are flat, create forks from the main folder". a sub that needs another fork says so in its final message (or, later, asks its parent via `msg`). it's layout, not security.
 
 ## commands
@@ -207,7 +220,9 @@ n=$(pfs new add-csv -q) && pfs run "$n" --bg pi -p "add a csv export for balance
 ```
 pfs new [name] [--from <rev> | --of <n>] [--open | -q]
 pfs ls [--overlap] [--json] [--all]  active forks, * marks the one you're in, lineage, work to land
+                               (outside any repo: every main's forks, and the ones whose main is gone)
 pfs port                       the current fork's base port
+pfs path [<n>]                 a fork's folder, absolute: cd "$(pfs path 5)"
 pfs wait [<n>[.<run>]...] [--timeout]  block until those forks' bg runs (or those runs) have ended
 pfs open <n>                   the door: your shell in fork n, $PORT set. exit to leave
 pfs run [<n>] [--bg [-q]] <cmd...>  run a command in fork n
@@ -260,7 +275,7 @@ each fork's git lives inside its folder, so deleting the folder would delete its
 
    all three are said at once, so one look is enough.
 4. copies the fork's branch into the main repo (`pfs/5-csv-addition`), ready to review or merge. `git branch --list 'pfs/*'` doubles as history, and cleanup is plain `git branch -d`.
-5. deletes `.forks/5/` (its runs and logs go with it), then appends an `rm` line to the ledger.
+5. deletes fork 5's folder (its runs and logs go with it), then appends an `rm` line to the ledger.
 6. prints one plain line on how the branch meets main's current branch right now (`git merge-tree`, nothing touched): `vs main right now: merges clean`, `already in it`, or `2 files would conflict (src/text.ts, src/text.test.ts) · resolve when merging`. same exit code either way, no "fix this": it's for picking a merge order, and it goes stale as soon as something else merges. dogfooded: in a 3-way fan-in, merged one at a time, it named the two files that then conflicted. merge-tree only sees commits, so the main folder's own uncommitted files that the merge would write are named too (`merges clean, once README.md (uncommitted here) is committed or stashed`): git refuses the merge until then.
 
 several at once: `pfs rm 3 5 7` takes one look at who's working (one lsof, before the first removal; if lsof can't run, nothing is removed), then checks and removes each fork on its own, in order. a refused one keeps only itself, and rm exits 1 after trying them all. 0.2s for a refusal like the one above.
@@ -271,7 +286,7 @@ the fork's sessions stay in `~/.pi/agent/sessions/`.
 
 rm's first two checks, made of things pfs doesn't own: who has a process in the fork, and whether a harness conversation there is still working. `src/occupants.rs` puts them together; the harness part comes from the harness table.
 
-- **processes:** one `lsof -a -d cwd -Fpcn +c 0` lists every process's working folder (~0.1s for ~430 processes; no tree walk, so node_modules doesn't matter), kept when it's the fork or inside it, component-wise (`.forks/5` holds `.forks/5/src`, not `.forks/50`). it doesn't care who started a process: a sub, a door, a terminal pi or claude, `bun dev`, an editor, a shell that cd'ed in, a pi-web bash command that happens to be running. pfs's own runs still going count too, wherever their folder is now (a door whose shell cd'ed out is still a door). processes that are a run's (under it in the process tree, or its waiter) fold into the run's line, and a loose process's children into it, so a pi sub is one line, not ten. the waiter stands in its run's folder, so a `pfs run 3 --bg` typed from fork 5 leaves nothing in fork 5.
+- **processes:** one `lsof -a -d cwd -Fpcn +c 0` lists every process's working folder (~0.1s for ~430 processes; no tree walk, so node_modules doesn't matter), kept when it's the fork or inside it, component-wise (`…/5` holds `…/5/src`, not `…/50`). it doesn't care who started a process: a sub, a door, a terminal pi or claude, `bun dev`, an editor, a shell that cd'ed in, a pi-web bash command that happens to be running. pfs's own runs still going count too, wherever their folder is now (a door whose shell cd'ed out is still a door). processes that are a run's (under it in the process tree, or its waiter) fold into the run's line, and a loose process's children into it, so a pi sub is one line, not ten. the waiter stands in its run's folder, so a `pfs run 3 --bg` typed from fork 5 leaves nothing in fork 5.
 - **conversations:** what lsof can't see is a conversation that's thinking. pi-web hosts every session in one process whose folder is elsewhere, and a model call is network, not a process. but harnesses file their conversations, and pi's say where a turn stands: pi appends a whole entry when each message ends (`appendFileSync` at message_end, never token by token), so the last message is the turn's state. your prompt or a tool's result = the model is about to answer (thinking); an assistant message that called tools = tools running; any other ending (stop, length, aborted, error) = done; other roles (system, `!` commands, extension messages) and other entries are skipped. checked on 400 real session files: the only open one was the live session doing the check. pi files a folder's conversations in `<agent dir>/sessions/--<path>--/` (pi-web too), or flat in `PI_CODING_AGENT_SESSION_DIR`; each file's first line names its folder, so a conversation started in a subfolder of the fork counts, and the lossy folder names (`5/x` and `5-x` encode the same) never decide. pfs reads files and couples to nobody: the reader is the pi entry's `conversations` in the harness table, ~1ms a fork.
 - **killed runs:** a `pi -p` sub killed mid-tool (SIGTERM) exits 143 and writes no closing message: its last entry is the killed command's result, so it reads mid-turn forever. so an open conversation doesn't count when nobody is in the fork (no process, no pfs run going) and its last write came at or before the fork's latest recorded run end (+1s: the exit line is ms-precise and written just after the process ended). a died run (no exit line) records no end, so it clears nothing. stays harness-neutral: it compares pfs's own run records with a file's last write.
 - **accepted gaps** (session `01a13d07`): a power loss mid-turn and a pi killed in a terminal leave a turn open (`--force`); an error pi auto-retries reads closed for a few seconds; a pi-web chat that's open but idle reads closed (nobody's working); a pi-web chat thinking in a fork where an unrelated run ended later reads as that dead run's. not followed: a `sessionDir` in pi's settings.json, `--session-dir`, and conversations filed under a symlinked alias of the fork's path (`/tmp/…` for `/private/tmp/…`).
@@ -284,6 +299,15 @@ rm's first two checks, made of things pfs doesn't own: who has a process in the 
 - a footer extension: `ctx.ui.setStatus` → "fork 3 · cli-check" inside a fork, "pfs: 2 running" in the parent.
 - `msg`: separate cli. a mailbox per session id, delivered by a pi extension (like pi's [file-trigger example](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/examples/extensions/file-trigger.ts)) or rpc `steer` / `follow_up`. hub-and-spoke with hop limits, so agents can't ping-pong forever.
 - deferred from the `git fork` design: `land` (rebase → checks → fast-forward) and `heat` (bounces per file, spine meter).
+
+## pfs builds pfs (v0.4)
+
+forks moved out of the repo (m-dcbb). the layout is one coupled change (place.rs, new.rs and the hammer's 93 `.forks` paths), so it went to one sub (A). in parallel a second (B) built the every-repo listing as a standalone module nobody called yet, against a contract both tasks spelled out (`.main`, `.git/pfs/forks-dir`, `<n>/`, `.rm-<n>/`). the installed 0.3 pfs ran the whole round: it made both forks, ran both subs and landed them. the new build only ever ran in throwaway repos with `PFS_HOME` on scratch: run in pfs-cli's main, it would have moved the ledger out from under the installed pfs mid-round. A took ~27 minutes (+1273/-283, the hammer at 265), B ~9 (one 787-line file).
+
+- **fan-in:** `--overlap` listed only main.rs (two `mod` lines, separate hunks), so both merged clean. main then wired B into `pfs ls` outside any repo (`place::try_here`) and added 11 hammer checks: 151 → 161 unit tests, 265 → 276 hammer checks.
+- **A's calls:** `Repo` resolves its main's forks folder once, from the record, never by guessing `<forks dir>/<name>` (that may be another main's). folders are made under the ledger lock with an exclusive mkdir, the record is written last, and `.main` and the record are written whole. the same-disk check runs before the first fork, so a record never points at another disk; EXDEV was tried on a throwaway APFS disk image. 0.3 forks are refused from inside too: otherwise `pfs new` there would make one a main.
+- **B's calls:** an orphan's commits are counted against every other branch, local and remote-tracking (the ledger's base lives in the main that's gone), so a pushed branch counts as kept. a folder with no `.git` gets no git call: git would climb to a repo above it, maybe a dotfiles repo in `~`.
+- **interop.sh:** from main, 0 for all 18 tools. inside a fork, every tool still sees the fork's own files. the first write-mode row first read 1: caches the in-fork column left in fork 1 (pytest, mypy), not prettier. a reset before the write modes fixed the measurement.
 
 ## pfs builds pfs (v0.3)
 
@@ -365,7 +389,7 @@ v0 to v0.2 put every process pfs started in a fork inside a macos seatbelt profi
 ## open questions
 
 - `--context`: thoughts pending.
-- forks next to the repo instead of in it (`../<repo>.forks/<n>`, same volume, nothing run from main walks into them) would end the interop words above for good. it costs "everything about a repo stays with it": move or delete the repo and its forks stay behind. `.git/` is out (jest, above).
+- telling a copy of a main from the original by path alone fails in one order: if the original moved and the copy runs pfs before it does, the copy takes over the forks (nothing is lost, they land in the copy). a random token in both `.main` and the record would settle it.
 
 ## build plan
 

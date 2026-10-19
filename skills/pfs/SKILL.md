@@ -9,7 +9,7 @@ You orchestrate from the **main folder**. Subs work in forks. Work comes back on
 
 ## The model
 
-- **A fork is a folder:** `.forks/<n>`, an APFS clone of the main folder as it is (node_modules, `.env`, uncommitted work and all).
+- **A fork is a folder** outside the repo, `~/.pfs/forks/<repo>/<n>` (`pfs path <n>` prints it): an APFS clone of the main folder as it is (node_modules, `.env`, uncommitted work and all). Nothing run in the main folder sees forks, so no tool needs a setting.
   - It has its own full copy of `.git` and its own branch `pfs/<n>-<name>`.
   - It gets ports `40000 + 10n …`, delivered as `$PORT`.
   - Nothing walls it. The rules are words: subs follow the repo's AGENTS.md (block below), and nothing is added to a sub's prompt but its task.
@@ -33,10 +33,11 @@ pfs wait [<n>[.<run>]...] [--timeout <secs>]  # block until bg runs end; exit 0 
 pfs logs <n>[.<run>] [-f]             # a bg run's output (with pi -p: its final answer)
 pfs diff <n> [--stat | -- <paths>]    # everything fork n changed since it started, uncommitted included
 pfs open <n>                          # the door: your shell in fork n, $PORT set (for a human)
+pfs path [<n>]                        # fork n's folder: cd "$(pfs path <n>)"
 pfs rm <n>... [--force]               # land each branch in main, delete the folders; one plain merge note each
 ```
 
-`new` and `rm` run from the main folder. Everything else works from anywhere, into any fork.
+`new` and `rm` run from the main folder. Everything else works from anywhere, into any fork. Outside any repo, `pfs ls` lists every repo's forks and flags the ones whose repo is gone.
 
 ## The loop
 
@@ -45,7 +46,6 @@ pfs rm <n>... [--force]               # land each branch in main, delete the fol
 - **Commit main**, or knowingly keep its wip: forks copy it as-is. A committed main keeps every fork's diff readable, and a sub's `git add -A` can't sweep your wip into its branch. `pfs new` names the uncommitted files a fork carried; if rm's note later says `once X (uncommitted here) is committed or stashed`, that's your wip in the merge's way.
 - **AGENTS.md** in the repo: build/lint/test commands, the code style, and the fork etiquette below. It's the only instructions a sub gets besides its task.
 - **A formatter config** (e.g. `rustfmt.toml`) so nobody reformats whole files. Without one, one sub's `cargo fmt` conflicts with every other fork.
-- **Tools that walk into `.forks/`:** prettier, eslint, biome, jest, vitest, black and isort, run from main, format, lint and test every fork, and their writes land inside the forks. Give each one `.forks` before fanning out: `.prettierignore`, eslint's `ignores`, biome's `vcs.useIgnoreFile`, jest's `testPathIgnorePatterns` + `modulePathIgnorePatterns`, vitest's `test.exclude`, black's `extend-exclude`, isort's `extend_skip`. `bun test`, tsc, `node --test`, ruff, pytest, mypy, rg and cm already skip forks.
 - **Know what's main's** and keep it for fan-in: shared files (below), anything outside the repo, pushing.
 
 ### 1. Split
@@ -80,7 +80,7 @@ n=$(pfs new wait -q) && r=$(pfs run "$n" --bg -q pi -p "$task")
 
 - `pfs wait <n>.<run>...` blocks and prints one line per run as it settles (`5-wait   bg 5.1 done`). A sub that already ended, even crashed in its first second, still reports how. `pfs wait <n>` waits on whatever runs in the fork now.
 - To peek meanwhile: `pfs ls` (running, or how it ended) and `pfs diff <n> --stat`. `pi -p` prints only at the end, so its log is empty until then.
-- The conversation so far is the harness's business: pi files sessions by folder, so `cd .forks/<n> && lookup last latest` reads it.
+- The conversation so far is the harness's business: pi files sessions by folder, so `cd "$(pfs path <n>)" && lookup last latest` reads it.
 
 ### 5. Review
 
@@ -122,6 +122,8 @@ To update one fork: `pfs run <n> git fetch origin`, then `pfs run <n> git rebase
 ## working in a pfs fork
 - write only inside your fork. reads are open: other forks and the main folder are someone else's work in progress, so read them, never write there. `pfs ls` says which fork you're in (the `*`)
 - commit on your branch (`pfs/<n>-…`) when <fmt, lint, tests> are clean. don't switch branches
+- finish clean: everything worth keeping is committed before your final message. `pfs rm` lands commits and nothing else
+- never delete a fork's folder by hand, yours or anyone's: `pfs rm` from the main folder is the only way out
 - don't push: a fork has your credentials and the network, but the main folder reviews, merges and pushes
 - servers listen on `$PORT` (or `pfs port`), never a fixed port like 3000: parallel forks would collide
 - forks are flat: `pfs new` fails in here. if the task needs more hands, say so in your final message

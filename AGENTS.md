@@ -23,9 +23,11 @@ pfs: forks of a folder, for you and your agents. rust, macOS only (apfs clones).
 
 - write only inside your fork. reads are open: other forks and the main folder are someone else's work in progress, so read them, never write there. `pfs ls` says which fork you're in (the `*`)
 - commit on your branch (`pfs/<n>-…`) when `cargo fmt`, `cargo test` and `cargo clippy --all-targets` are clean. don't switch branches
+- finish clean: everything worth keeping is committed before your final message. `pfs rm` lands commits and nothing else
+- never delete a fork's folder by hand, yours or anyone's: `pfs rm` from the main folder is the only way out
 - don't push: a fork has your credentials and the network, but the main folder reviews, merges and pushes
 - servers listen on `$PORT` (or `pfs port`), never a fixed port like 3000: parallel forks would collide. your block is the 10 ports from `$PORT`
 - forks are flat: `pfs new` fails in here. if the task needs more hands, say so in your final message
-- `cargo test`, `cargo clippy` and the hammer all work in here. to try your build by hand, make a throwaway repo under `/tmp` and drive it with `./target/debug/pfs`
+- `cargo test`, `cargo clippy` and the hammer all work in here. to try your build by hand, make a throwaway repo under `/tmp`, `export PFS_HOME=$(mktemp -d)`, and drive it with `./target/debug/pfs`. never run your build in a real repo (this one's main folder, your own fork): the installed pfs manages those, and a newer build may rewrite their state
 - don't edit DESIGN.md, README.md or sandbox/hammer.sh unless the task says so: the main folder writes docs and end-to-end checks at fan-in, so parallel forks don't collide there. say in your final message what end-to-end checks to add
 - don't touch `.marbles/`
