@@ -19,6 +19,7 @@ mod runs;
 mod spawn;
 mod store;
 mod venv;
+mod writers;
 
 use std::process::ExitCode;
 

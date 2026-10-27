@@ -19,15 +19,16 @@ threat model: honest frontier agents and your own mistakes, not hostile ones. a 
 
 ## where it fits
 
-three small tools, one job each. they join on the folder: a harness files its conversations by working folder (pi does), so a fork's path finds them.
+small tools, one job each. they join on the folder: a harness files its conversations by working folder (pi does), so a fork's path finds them.
 
 | tool | job |
 |---|---|
 | `lookup` | reads sessions: what happened |
 | `pfs` | makes forks: where work happens |
-| `msg` (later) | writes into sessions: agent → agent, you → agent |
+| `msg` | writes into sessions: agent → agent, you → agent. a session started from another's bash is its child; a child's end reaches its parent as a message |
+| `relay` | keeps a session going: nudges at 40% context (then every 5%), resets it in place with a catch-up from lookup |
 
-"orchestration" is a skill that combines the three, not another binary.
+"orchestration" is a skill that combines them, not another binary: the orchestrator forks with pfs, starts subs from its own bash (lineage), waits on msg (`msg_wait from: "children"`), lands through rm, and relays at checkpoints.
 
 pfs is forks first. the main use is you driving several forks of one repo, one terminal per fork. subagents are just another occupant of a fork.
 
@@ -79,6 +80,7 @@ pfs is forks first. the main use is you driving several forks of one repo, one t
   - `pfs new` = a copy of the main folder as it is, uncommitted work included. a note names the uncommitted files it carried (one tree diff off the start snapshot pfs takes anyway): a `git add -A` in the fork would commit them on its branch.
   - `pfs new --of 5` = a copy of fork 5's folder as it is: its uncommitted work and build caches, a new branch on top of its commits. fork 5 keeps going, main isn't touched, and no git runs in fork 5 (it's a file copy). this is "fork that": something interesting is happening in fork 5, take it from there.
   - `pfs new --from <rev>` = a clean start at a commit (ignored files like `.env` and `node_modules` come from main). any rev main has (`main~3`, a teammate's `origin/x`, a removed fork's saved `pfs/5-x`), or a live fork's `pfs/5-x`: pfs copies that branch from the fork into the new one, not into main.
+- **who's writing in what it copies:** a clone taken while a process writes (a bun dev server's sqlite in WAL mode: the db, its -wal and -shm) can catch a file mid-write. pfs can't make that copy consistent, so it names the writers while redoing is cheap: one `lsof -b -w -d 0-999999 -Fpcfatn +c 0`, side by side with the clone and stopped after 3s, keeps regular files open for writing (`w`, `u`) inside the folder being copied (main, or fork n for `--of`), component-wise on resolved paths. pfs's own `.git/pfs/` doesn't count (every bg run's processes hold its log open through stdout, and the copy drops it), nor does `.forks`. one note per process (`note: bun (pid 4242) has var/v2.sqlite, var/v2.sqlite-shm, var/v2.sqlite-wal open for writing in main, so the fork's copy may be torn. …`), and the fork is made anyway. a check that can't run says so in a note. cost: ~2ms on a 1,000-file repo; in a 1-file repo the clone is faster than lsof's ~80ms, so it shows (~75ms → ~130ms). vim swap files, `target/.cargo-lock` and a git command mid-write are real writers and get named too.
 - **fork of a fork:** no nesting, and no rm needed. `--of 5` (as-is) or `--from pfs/5-x` (clean). removing 5 later doesn't touch its copies: each fork has its own git.
 - **branch:** each fork checks out its own branch, `pfs/<n>-<name>`, at creation.
 
@@ -213,7 +215,7 @@ n=$(pfs new add-csv -q) && pfs run "$n" --bg pi -p "add a csv export for balance
 ### forks are flat
 
 - no forks inside forks. every fork lives in its main's forks folder. need more hands? make more forks from the main folder. a fork *of* a fork is fine (`--of 5`): flat folder, lineage in the ledger.
-- `pfs new` inside a fork fails: "forks are flat, create forks from the main folder". a sub that needs another fork says so in its final message (or, later, asks its parent via `msg`). it's layout, not security.
+- `pfs new` inside a fork fails: "forks are flat, create forks from the main folder". a sub that needs another fork says so in its final message (or asks its parent via `msg`). it's layout, not security.
 
 ## commands
 
@@ -228,6 +230,7 @@ pfs open <n>                   the door: your shell in fork n, $PORT set. exit t
 pfs run [<n>] [--bg [-q]] <cmd...>  run a command in fork n
 pfs logs <n>[.<run>] [-f]      a background run's output
 pfs diff <n>                   what fork n changed since it started, uncommitted included
+pfs kill [<n>]                 stop what's left working in fork n: never its pfs runs, never the caller
 pfs rm <n>... [--force]        save each branch to main, delete the forks
 ```
 
@@ -264,12 +267,12 @@ each fork's git lives inside its folder, so deleting the folder would delete its
    $ pfs rm 1
    pfs: fork 1-demo has someone working in it:
      1.1 bg pid 44143  sleep 20 & sleep 20; wait  (stop: kill -- -44143)
-     pid 44145  sleep  (finish or quit it)
+     pid 44145  sleep  (stop: pfs kill 1)
    rm never stops anyone, and --force doesn't skip this: rm again once they're done
    fork 1-demo: pi conversation 01a14f00 is mid-turn (running tools, last write 0s ago). wait for it, or if it crashed: pfs rm 1 --force
    fork 1-demo has uncommitted changes. commit them on pfs/1-demo (see them with pfs diff 1), or pass --force to drop them
    ```
-   a bg run leads its own process group, so `kill -- -<pid>`. a door is someone's shell: "exit that shell", never a kill, and "that's the door you're in: exit it, then rm from a normal shell" when rm was typed inside it (the door is in rm's own lineage). anything else rm runs under gets "leave it, then rm from outside the fork"; everything else (a terminal pi, an editor, a dev server) "finish or quit it". `--force` never skips this, and rm never kills anything.
+   a bg run leads its own process group, so `kill -- -<pid>`. a door is someone's shell: "exit that shell", never a kill, and "that's the door you're in: exit it, then rm from a normal shell" when rm was typed inside it (the door is in rm's own lineage). anything else rm runs under gets "leave it, then rm from outside the fork". a fg run gets "finish or quit it", and every process that's no run's (a server a sub left, a terminal pi, an editor, a shell that cd'ed in) "stop: pfs kill <n>". `--force` never skips this, and rm never kills anything.
 2. **refuses while a conversation in the fork is mid-turn,** unless `--force`: a crash leaves a turn open forever, and `--force` is the way out for it.
 3. **refuses uncommitted work,** unless `--force`. uncommitted is per file: a file that matches neither the last commit nor how the fork started. so the main folder's wip a fork was born with (an untracked lockfile, an edit) doesn't block rm while the fork leaves it alone, and doesn't ride along into the branch either.
 
@@ -281,6 +284,14 @@ each fork's git lives inside its folder, so deleting the folder would delete its
 several at once: `pfs rm 3 5 7` takes one look at who's working (one lsof, before the first removal; if lsof can't run, nothing is removed), then checks and removes each fork on its own, in order. a refused one keeps only itself, and rm exits 1 after trying them all. 0.2s for a refusal like the one above.
 
 the fork's sessions stay in `~/.pi/agent/sessions/`.
+
+### pfs kill
+
+why: in a real fan-out a sub stopped its own bun dev server with `pkill -INT -f "bun src/server.ts"`. main and every fork run that exact command line, so it also stopped main's preview server and another fork's dev server mid-task. pfs keeps folders and ports apart, not processes, and the safe moves (`kill <pid>`, `lsof -ti tcp:$PORT`) take thought, so subs reach for a pattern.
+
+`pfs kill [<n>]` stops what rm would list as no run's: each process working in the fork that's no pfs run's, and what it started there (a TERM to `sh -c 'bun …'` leaves bun running, so it asks `present` again without the ones found until nothing new turns up, at most 64 rounds). never a pfs run (bg, fg, a door) or what runs under it, never the caller's lineage (a sub's `pfs kill` runs under its own pi, bash and waiter in that fork), never another folder's process, whatever its command line. SIGTERM to all at once, then up to 3s; a pid is signalled and counted only while its start time matches the listing (a recycled pid isn't the process listed, and a zombie reads as gone). exit 0 once they're all gone, 1 while one is left, with `kill -9 <pid>` next to it; the runs it left alone are listed with rm's hints. ~0.1s.
+
+by folder, not by port: a server in main on a hand-picked port can sit in a fork's block (in a real fan-out, a preview server on 40980 sat in fork 98's), and the folder is what rm goes by, so `pfs kill 5` is exactly what clears rm's "has someone working in it". the cost: a shell someone cd'ed into the fork and an editor's helpers count as leftovers too. interactive shells ignore TERM, so they're reported, not stopped.
 
 ## who's working in a fork
 
@@ -297,7 +308,6 @@ rm's first two checks, made of things pfs doesn't own: who has a process in the 
 - `--context`: start a sub from a copy of the parent's conversation. with `--agent` gone it's harness flags in the chain, no pfs code: `pfs run "$n" --bg pi --fork "$PI_SESSION_FILE" -p "<task>"` (`SessionManager.forkFrom(source, cwd, …)`; `--fork` can't be combined with `--session`, `--continue`, `--resume` or `--no-session`). untested; the open part is role confusion (the sub inherits the parent's "fan out, merge, push").
 - a quick throwaway mode: fork, run, show the result + diff, delete the folder, keep one ledger line.
 - a footer extension: `ctx.ui.setStatus` → "fork 3 · cli-check" inside a fork, "pfs: 2 running" in the parent.
-- `msg`: separate cli. a mailbox per session id, delivered by a pi extension (like pi's [file-trigger example](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/examples/extensions/file-trigger.ts)) or rpc `steer` / `follow_up`. hub-and-spoke with hop limits, so agents can't ping-pong forever.
 - deferred from the `git fork` design: `land` (rebase → checks → fast-forward) and `heat` (bounces per file, spine meter).
 
 ## pfs builds pfs (v0.4)

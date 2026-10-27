@@ -28,12 +28,15 @@ pfs run 8 --bg bun dev           # background; pfs logs 8.1 to read it
 pfs diff 8 --stat                # everything fork 8 changed, uncommitted included
 pfs wait 8 9                     # block until their bg runs (agents included) have ended
 pfs wait 8.1                     # just that run, and how it ended even if it already has
+pfs kill 8                       # stop what's left running in fork 8 (a server a sub left), never its pfs runs
 pfs rm 8 9                       # saves pfs/8-add-csv (and 9's branch) into main, then deletes the folders
 ```
 
 inside a fork the number is optional, and every command but `new` and `rm` (which run from the main folder) works into any fork.
 
-`pfs rm` refuses while anyone works in the fork: a process with its folder there (a sub, a door, a terminal pi, a dev server), a harness conversation mid-turn (pi's, read from its session files, so pi-web chats count too), or uncommitted work. `--force` skips the last two (a crashed conversation, work you don't want), never the first, and nothing is ever killed.
+`pfs rm` refuses while anyone works in the fork: a process with its folder there (a sub, a door, a terminal pi, a dev server), a harness conversation mid-turn (pi's, read from its session files, so pi-web chats count too), or uncommitted work. `--force` skips the last two (a crashed conversation, work you don't want), never the first, and nothing is ever killed: `pfs kill <n>` stops the leftover processes it names, by folder, so another fork's server with the same command line is never hit.
+
+`pfs new` copies what's in the folder right now, gitignored data included. if a process has files open for writing there (a dev server's sqlite), it names it: the fork's copy of those files may be torn.
 
 ## where forks live
 

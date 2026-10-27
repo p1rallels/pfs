@@ -48,7 +48,7 @@ struct Found {
 
 /// What to tell someone about one occupant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Hint {
+pub(super) enum Hint {
     /// A bg run leads its own process group.
     Kill(i32),
     /// A door is someone's shell: never a kill.
@@ -56,7 +56,10 @@ enum Hint {
     DoorYoureIn,
     /// rm runs under it, so rm can't finish before it does.
     YoureIn,
+    /// A fg run: someone sits at it.
     Quit,
+    /// A process that's no run's: what `pfs kill <n>` stops.
+    Leftover(u32),
 }
 
 /// Each fork is checked and removed on its own, so one that's refused
@@ -262,7 +265,7 @@ fn refusal(fork: &Fork, found: &Found, own: &[i32], now: SystemTime) -> Option<S
 fn someone_there(fork: &Fork, present: &[Occupant], own: &[i32]) -> Option<String> {
     let lines: Vec<String> = present
         .iter()
-        .map(|occupant| line(fork.id, occupant, hint(occupant, own)))
+        .map(|occupant| line(fork.id, occupant, hint(fork.id, occupant, own)))
         .collect();
     (!lines.is_empty()).then(|| {
         format!(
@@ -273,7 +276,7 @@ fn someone_there(fork: &Fork, present: &[Occupant], own: &[i32]) -> Option<Strin
     })
 }
 
-fn hint(occupant: &Occupant, own: &[i32]) -> Hint {
+pub(super) fn hint(id: u32, occupant: &Occupant, own: &[i32]) -> Hint {
     let kind = match occupant {
         Occupant::Run(run) => Some(run.start.kind),
         Occupant::Process(_) => None,
@@ -283,7 +286,8 @@ fn hint(occupant: &Occupant, own: &[i32]) -> Hint {
         (_, true) => Hint::YoureIn,
         (Some(Kind::Bg), false) => Hint::Kill(occupant.pid()),
         (Some(Kind::Open), false) => Hint::ExitDoor,
-        (Some(Kind::Fg) | None, false) => Hint::Quit,
+        (Some(Kind::Fg), false) => Hint::Quit,
+        (None, false) => Hint::Leftover(id),
     }
 }
 
@@ -294,12 +298,13 @@ fn say(hint: Hint) -> String {
         Hint::DoorYoureIn => "that's the door you're in: exit it, then rm from a normal shell".to_string(),
         Hint::YoureIn => "this rm runs inside it: leave it, then rm from outside the fork".to_string(),
         Hint::Quit => "finish or quit it".to_string(),
+        Hint::Leftover(id) => format!("stop: pfs kill {id}"),
     }
 }
 
 /// `5.1 bg pid 4242  pi -p fix the csv…  (stop: kill -- -4242)`, or for a
-/// process that's no run's, `pid 70897  sleep  (finish or quit it)`.
-fn line(id: u32, occupant: &Occupant, hint: Hint) -> String {
+/// process that's no run's, `pid 70897  sleep  (stop: pfs kill 5)`.
+pub(super) fn line(id: u32, occupant: &Occupant, hint: Hint) -> String {
     match occupant {
         Occupant::Run(run) => format!(
             "  {id}.{} {} pid {}  {}  ({})",
@@ -445,35 +450,36 @@ mod tests {
 
     #[test]
     fn each_kind_gets_its_own_hint() {
-        assert_eq!(hint(&run(1, Kind::Bg, 4242, "pi -p x"), ELSEWHERE), Hint::Kill(4242));
+        assert_eq!(hint(5, &run(1, Kind::Bg, 4242, "pi -p x"), ELSEWHERE), Hint::Kill(4242));
         assert_eq!(
-            hint(&run(2, Kind::Open, 4300, "/bin/zsh (open)"), ELSEWHERE),
+            hint(5, &run(2, Kind::Open, 4300, "/bin/zsh (open)"), ELSEWHERE),
             Hint::ExitDoor
         );
-        assert_eq!(hint(&run(3, Kind::Fg, 4400, "bun dev"), ELSEWHERE), Hint::Quit);
-        assert_eq!(hint(&process(4500, "sleep"), ELSEWHERE), Hint::Quit);
+        assert_eq!(hint(5, &run(3, Kind::Fg, 4400, "bun dev"), ELSEWHERE), Hint::Quit);
+        assert_eq!(hint(5, &process(4500, "sleep"), ELSEWHERE), Hint::Leftover(5));
         assert_eq!(say(Hint::Kill(4242)), "stop: kill -- -4242");
         assert_eq!(say(Hint::ExitDoor), "exit that shell");
         assert_eq!(say(Hint::Quit), "finish or quit it");
+        assert_eq!(say(Hint::Leftover(5)), "stop: pfs kill 5");
     }
 
     #[test]
     fn the_door_youre_in_is_found_in_rms_own_lineage() {
         let door = run(1, Kind::Open, 52014, "/bin/zsh (open)");
         let own = [61000, 60990, 52014, 52010, 400];
-        assert_eq!(hint(&door, &own), Hint::DoorYoureIn);
+        assert_eq!(hint(5, &door, &own), Hint::DoorYoureIn);
         assert_eq!(
-            say(hint(&door, &own)),
+            say(hint(5, &door, &own)),
             "that's the door you're in: exit it, then rm from a normal shell"
         );
-        assert_eq!(hint(&door, &[61000, 60990, 400]), Hint::ExitDoor);
+        assert_eq!(hint(5, &door, &[61000, 60990, 400]), Hint::ExitDoor);
     }
 
     #[test]
     fn nothing_rm_runs_inside_gets_a_kill() {
         let own = [61000, 4242, 4400];
-        assert_eq!(hint(&run(1, Kind::Bg, 4242, "pi -p x"), &own), Hint::YoureIn);
-        assert_eq!(hint(&process(4400, "pi"), &own), Hint::YoureIn);
+        assert_eq!(hint(5, &run(1, Kind::Bg, 4242, "pi -p x"), &own), Hint::YoureIn);
+        assert_eq!(hint(5, &process(4400, "pi"), &own), Hint::YoureIn);
     }
 
     #[test]
@@ -508,7 +514,7 @@ mod tests {
             "fork 5-x has someone working in it:\n\
              \x20 5.1 bg pid 4242  pi -p fix the csv\u{2026}  (stop: kill -- -4242)\n\
              \x20 5.2 open pid 4300  /bin/zsh (open)  (exit that shell)\n\
-             \x20 pid 70897  sleep  (finish or quit it)\n\
+             \x20 pid 70897  sleep  (stop: pfs kill 5)\n\
              rm never stops anyone, and --force doesn't skip this: rm again once they're done"
         );
     }
@@ -541,7 +547,7 @@ mod tests {
         assert_eq!(
             refusal(&fork(), &found, ELSEWHERE, now).unwrap(),
             "fork 5-x has someone working in it:\n\
-             \x20 pid 70897  sleep  (finish or quit it)\n\
+             \x20 pid 70897  sleep  (stop: pfs kill 5)\n\
              rm never stops anyone, and --force doesn't skip this: rm again once they're done\n\
              fork 5-x has conversations mid-turn:\n\
              \x20 pi conversation 01a1ffff is mid-turn (thinking, last write 5s ago)\n\

@@ -382,7 +382,7 @@ spid=$!
 npid=$!
 sleep 0.3
 out=$("$PFS" rm "$id" 2>&1)
-check "a process with its folder in the fork blocks rm" contains "$out" "pid $spid  sleep  (finish or quit it)"
+check "a process with its folder in the fork blocks rm" contains "$out" "pid $spid  sleep  (stop: pfs kill $id)"
 check "  …one in a folder whose name only starts the same doesn't" denied contains "$out" "pid $npid"
 check "  …--force doesn't skip it" denied "$PFS" rm "$id" --force
 check "  …the fork is still there" test -d "$forks/$id"
@@ -664,6 +664,91 @@ check "  …its ledger lives in its own .git/pfs" grep -q '"type":"rm","id":2' "
 (cd "$inner" && "$PFS" rm 1 --force >/dev/null)
 rm -rf "$inner"
 check "a closed pipe ends pfs quietly" test -z "$("$PFS" ls 2>&1 >/dev/null | head -1)"
+
+section "pfs new: who's writing in the folder it copies"
+cd "$toy" || exit 1
+made=()
+mkdir -p node_modules/.cache
+(exec 3>>node_modules/.cache/db.sqlite 4<>node_modules/.cache/db.sqlite-wal && exec sleep 30) &
+wpid=$!
+sleep 0.3
+out=$("$PFS" new writer 2>&1)
+id=$(new_id "$out")
+made+=("$id")
+check "a writer in main: new still makes the fork" test -n "$id" -a -d "$forks/$id"
+check "  …and names the writer, its pid and both files" contains "$out" "note: sleep (pid $wpid) has node_modules/.cache/db.sqlite, node_modules/.cache/db.sqlite-wal open for writing in main, so the fork's copy may be torn"
+id=$("$PFS" new writer-q -q 2>"$work/scratch/new-q.err")
+made+=("$id")
+check "  …with -q, stdout is just the number" grep -qxE '[0-9]+' <<<"$id"
+check "  …and the note goes to stderr" grep -q "sleep (pid $wpid) has node_modules/.cache/db.sqlite" "$work/scratch/new-q.err"
+out=$("$PFS" new writer-from --from HEAD 2>&1)
+made+=("$(new_id "$out")")
+check "  …--from HEAD copies main's ignored files too, so it says the same" contains "$out" "sleep (pid $wpid) has node_modules/.cache/db.sqlite"
+kill "$wpid" 2>/dev/null
+wait "$wpid" 2>/dev/null
+(exec 3<node_modules/.cache/db.sqlite && exec sleep 30) &
+rpid=$!
+(exec 3>>.git/pfs/hammer-writer.log && exec sleep 30) &
+opid=$!
+sleep 0.3
+out=$("$PFS" new quiet-folder 2>&1)
+id=$(new_id "$out")
+made+=("$id")
+check "a reader, and a writer in pfs's own .git/pfs: the fork is made" test -n "$id" -a -d "$forks/$id"
+check "  …with no note" denied contains "$out" "open for writing"
+kill "$rpid" "$opid" 2>/dev/null
+wait "$rpid" "$opid" 2>/dev/null
+rm -f .git/pfs/hammer-writer.log
+(cd "$forks/$id" && exec 3>>node_modules/.cache/db.sqlite && exec sleep 30) &
+fpid=$!
+sleep 0.3
+out=$("$PFS" new copy-of --of "$id" 2>&1)
+made+=("$(new_id "$out")")
+check "--of: a writer in that fork's folder is named, in fork $id" contains "$out" "sleep (pid $fpid) has node_modules/.cache/db.sqlite open for writing in fork $id-quiet-folder"
+kill "$fpid" 2>/dev/null
+wait "$fpid" 2>/dev/null
+rm -rf node_modules/.cache
+"$PFS" rm "${made[@]}" --force >/dev/null 2>&1
+check "  …and every fork this section made is gone" sh -c 'for dir; do test ! -e "$dir" || exit 1; done' _ "${made[@]/#/$forks/}"
+
+section "pfs kill: what's left in a fork, and nothing else"
+cd "$toy" || exit 1
+id=$("$PFS" new leftovers -q 2>/dev/null)
+other=$("$PFS" new bystander -q 2>/dev/null)
+lpid=$(cd "$forks/$id" && sh -c 'nohup sleep 30 >/dev/null 2>&1 & echo $!')
+bpid=$(cd "$forks/$other" && sh -c 'nohup sleep 30 >/dev/null 2>&1 & echo $!')
+mpid=$(sh -c 'nohup sleep 30 >/dev/null 2>&1 & echo $!')
+out=$("$PFS" run "$id" --bg sleep 30)
+rpid=$(started_pid "$out")
+rrun=$(started_run "$out")
+sleep 0.3
+out=$("$PFS" kill "$id" 2>&1)
+code=$?
+check "a sub-style orphan in the fork is stopped" contains "$out" "stopped in fork $id-leftovers:"
+check "  …named with its pid" contains "$out" "  pid $lpid  sleep"
+check "  …gone" denied kill -0 "$lpid"
+check "  …and pfs kill exits 0" test "$code" -eq 0
+check "the same command in another fork lives on" kill -0 "$bpid"
+check "  …and in main" kill -0 "$mpid"
+check "a bg run in the fork is left alone" kill -0 "$rpid"
+check "  …and listed with rm's hint" contains "$out" "(stop: kill -- -$rpid)"
+kill -- -"$rpid" 2>/dev/null
+"$PFS" wait "$id.$rrun" >/dev/null 2>&1
+kill "$bpid" "$mpid" 2>/dev/null
+tpid=$(cd "$forks/$id" && sh -c 'trap "" TERM; nohup sleep 30 >/dev/null 2>&1 & echo $!')
+out=$("$PFS" kill "$id" 2>&1)
+code=$?
+check "an orphan that ignores TERM: pfs kill exits 1" test "$code" -eq 1
+check "  …and says what to do next" contains "$out" "pid $tpid  sleep  (kill -9 $tpid)"
+kill -9 "$tpid" 2>/dev/null
+run=$("$PFS" run "$id" --bg -q sh -c "sh -c 'nohup sleep 30 >/dev/null 2>&1 &'; sleep 0.3; '$PFS' kill")
+check "from inside the fork, no number: it ends 0, its own run untouched" "$PFS" wait "$run"
+check "  …the orphan it left is stopped" contains "$("$PFS" logs "$run")" "stopped in fork $id-leftovers:"
+check "  …and its own run isn't listed" denied contains "$("$PFS" logs "$run")" "pfs runs left alone"
+check "in main with no number: refused" contains "$("$PFS" kill 2>&1)" "which fork?"
+check "  …and a fork that isn't there: refused" denied "$PFS" kill 999
+check "once nothing's left, rm goes through" "$PFS" rm "$id" --force
+"$PFS" rm "$other" --force >/dev/null 2>&1
 
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

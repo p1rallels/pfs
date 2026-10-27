@@ -32,7 +32,7 @@ use crate::{
 
 /// lsof lives here on every mac; a full path still works when pfs is
 /// started with a bare PATH.
-const LSOF: &str = "/usr/sbin/lsof";
+pub(crate) const LSOF: &str = "/usr/sbin/lsof";
 const LSOF_ARGS: [&str; 6] = ["-a", "-d", "cwd", "-Fpcn", "+c", "0"];
 
 /// A run's exit line is written just after its process ended, with ms

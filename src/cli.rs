@@ -46,6 +46,14 @@ pub enum Command {
     #[command(about = "What a fork changed since it was created, uncommitted included")]
     Diff(DiffArgs),
     #[command(
+        about = "Stop the processes left working in a fork, never its pfs runs",
+        after_help = "Stops what rm lists as `stop: pfs kill <n>`: each process working in the fork that's no pfs run's, \
+                      and what it started there. A pfs run (bg, fg or a door) and whatever pfs kill runs under are \
+                      left alone, and so is every other folder's process, whatever its command line. \
+                      Sends SIGTERM, then waits up to 3s. Exits 0 once they're all gone, 1 if any is still running."
+    )]
+    Kill(KillArgs),
+    #[command(
         about = "Save each fork's branch to the main repo, then delete the fork",
         after_help = "Refuses a fork while anyone works in it (a process with its folder there, a pfs run still going), \
                       while a conversation there is mid-turn, or while it has uncommitted changes. \
@@ -175,6 +183,12 @@ pub struct DiffArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct KillArgs {
+    #[arg(value_name = "N", help = "Fork number; defaults to the fork you're in")]
+    pub fork: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct RmArgs {
     #[arg(
         value_name = "N",
@@ -273,6 +287,17 @@ mod tests {
         assert_eq!(path(&["5"]), Some(Some("5".to_string())));
         assert_eq!(path(&[]), Some(None));
         assert_eq!(path(&["5", "6"]), None);
+    }
+
+    #[test]
+    fn kill_takes_an_optional_fork() {
+        let kill = |argv: &[&str]| match Cli::try_parse_from(["pfs", "kill"].iter().chain(argv)).ok()?.command {
+            Command::Kill(args) => Some(args.fork),
+            _ => None,
+        };
+        assert_eq!(kill(&["5"]), Some(Some("5".to_string())));
+        assert_eq!(kill(&[]), Some(None));
+        assert_eq!(kill(&["5", "6"]), None);
     }
 
     #[test]

@@ -28,6 +28,7 @@ pfs: forks of a folder, for you and your agents. rust, macOS only (apfs clones).
 - don't push: a fork has your credentials and the network, but the main folder reviews, merges and pushes
 - servers listen on `$PORT` (or `pfs port`), never a fixed port like 3000: parallel forks would collide. your block is the 10 ports from `$PORT`
 - forks are flat: `pfs new` fails in here. if the task needs more hands, say so in your final message
+- you may have a parent: the session that started you. blocked on a decision → `msg_send` to `"parent"` with `wait_seconds`. never message other forks' agents, never acknowledge. your final message is your report: your parent gets it when you end
 - `cargo test`, `cargo clippy` and the hammer all work in here. to try your build by hand, make a throwaway repo under `/tmp`, `export PFS_HOME=$(mktemp -d)`, and drive it with `./target/debug/pfs`. never run your build in a real repo (this one's main folder, your own fork): the installed pfs manages those, and a newer build may rewrite their state
 - don't edit DESIGN.md, README.md or sandbox/hammer.sh unless the task says so: the main folder writes docs and end-to-end checks at fan-in, so parallel forks don't collide there. say in your final message what end-to-end checks to add
 - don't touch `.marbles/`

@@ -1,4 +1,5 @@
 mod diff;
+mod kill;
 mod logs;
 mod ls;
 mod new;
@@ -25,6 +26,7 @@ pub fn dispatch(command: Command) -> Result<i32> {
         Command::Logs(args) => logs::run(args),
         Command::Settle(args) => settle::run(args),
         Command::Diff(args) => diff::run(args),
+        Command::Kill(args) => kill::run(args),
         Command::Rm(args) => rm::run(args),
         Command::Wait(args) => spawn::wait_main(args),
     }

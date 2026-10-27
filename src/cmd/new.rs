@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    thread,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,6 +17,7 @@ use crate::{
     names, paths,
     place::{self, Place, Repo, parse_fork_ref},
     ports, runs, venv,
+    writers::{self, Writer},
 };
 
 /// What populate made: the venvs it re-pointed, the base commit, and main's
@@ -75,7 +77,8 @@ pub fn run(args: NewArgs) -> Result<i32> {
     let id = claim(&repo, &home)?;
     let branch = names::branch(id, name.as_deref());
     let fork_dir = place::fork_in(&home, id);
-    let Made { venvs, base, carried } = match populate(&repo, &fork_dir, &branch, &source) {
+    let (writers, made) = populate_watched(&repo, &fork_dir, &branch, &source);
+    let Made { venvs, base, carried } = match made {
         Ok(made) => made,
         Err(error) => {
             let _ = paths::remove_tree(&fork_dir);
@@ -105,6 +108,7 @@ pub fn run(args: NewArgs) -> Result<i32> {
         .chain(source_notes(&ledger, &source))
         .chain(venv_note(&venvs, &fork_dir))
         .chain(carried_note(&branch, &carried))
+        .chain(writer_notes(&writers, &folder_label(&ledger, &source)))
         .collect();
     let (out, err) = split_output(args.quiet, id, created, notes);
     out.iter().for_each(|line| println!("{line}"));
@@ -247,6 +251,23 @@ fn claim(repo: &Repo, home: &Path) -> Result<u32> {
     Ok(id)
 }
 
+/// populate, while one lsof looks for whoever has files open for writing in
+/// the folder being copied. Side by side, the check costs `pfs new` next to
+/// nothing, and it sees the folder as the clone does.
+fn populate_watched(
+    repo: &Repo,
+    fork_dir: &Path,
+    branch: &str,
+    source: &Source,
+) -> (Result<Vec<Writer>>, Result<Made>) {
+    thread::scope(|scope| {
+        let check = scope.spawn(|| writers::in_folder(source.dir(repo)));
+        let made = populate(repo, fork_dir, branch, source);
+        let writers = check.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (writers, made)
+    })
+}
+
 /// Clone, then make the clone a fork: its own branch, its own venvs, and a
 /// record of where it started. Every git command here runs in the new fork.
 fn populate(repo: &Repo, fork_dir: &Path, branch: &str, source: &Source) -> Result<Made> {
@@ -345,20 +366,32 @@ fn name_note(id: u32, raw: Option<&str>, name: Option<&str>) -> Option<String> {
     }
 }
 
+fn fork_label(ledger: &Ledger, id: u32) -> String {
+    ledger
+        .get(&id)
+        .map(|entry| entry.label())
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// The folder the clone came from: main's, or fork 5's for `--of 5`.
+fn folder_label(ledger: &Ledger, source: &Source) -> String {
+    match source {
+        Source::Fork { id, .. } => format!("fork {}", fork_label(ledger, *id)),
+        Source::Main { .. } | Source::Rev { .. } | Source::ForkBranch { .. } => "main".to_string(),
+    }
+}
+
 fn source_notes(ledger: &Ledger, source: &Source) -> Vec<String> {
-    let label = |id: u32| {
-        ledger
-            .get(&id)
-            .map(|entry| entry.label())
-            .unwrap_or_else(|| id.to_string())
-    };
     match source {
         Source::Fork { id, dir } => {
-            let copy = format!("a copy of fork {} as it is now, uncommitted work included", label(*id));
+            let copy = format!(
+                "a copy of fork {} as it is now, uncommitted work included",
+                fork_label(ledger, *id)
+            );
             let busy = (!forks::running(dir).is_empty()).then(|| {
                 format!(
                     "note: fork {} still has things running, so this is its folder mid-work",
-                    label(*id)
+                    fork_label(ledger, *id)
                 )
             });
             std::iter::once(copy).chain(busy).collect()
@@ -384,6 +417,29 @@ fn carried_note(branch: &str, carried: &[String]) -> Option<String> {
             paths::shown(files, 3)
         )),
     }
+}
+
+/// A clone taken while something writes can catch a file mid-write (a sqlite
+/// db and its -wal, say). pfs can't fix the copy, so it names the writers
+/// while it's cheap to redo. A check that couldn't run says so.
+fn writer_notes(writers: &Result<Vec<Writer>>, folder: &str) -> Vec<String> {
+    match writers {
+        Ok(writers) => writers.iter().map(|writer| writer_note(writer, folder)).collect(),
+        Err(error) => vec![format!(
+            "note: pfs couldn't check what's open for writing in {folder} ({error:#}), so it can't tell whether the copy caught a file mid-write"
+        )],
+    }
+}
+
+fn writer_note(writer: &Writer, folder: &str) -> String {
+    format!(
+        "note: {} (pid {}) has {} open for writing in {folder}, so the fork's copy may be torn. \
+         if that data matters, stop or pause {} (or point it at a copy) and fork again",
+        writer.command,
+        writer.pid,
+        paths::shown(&writer.files, 3),
+        writer.command
+    )
 }
 
 fn venv_note(venvs: &[PathBuf], fork_dir: &Path) -> Option<String> {
@@ -433,6 +489,47 @@ mod tests {
         );
         assert_eq!(name_note(8, Some("add-csv"), Some("add-csv")), None);
         assert_eq!(name_note(8, None, None), None);
+    }
+
+    #[test]
+    fn each_writer_in_the_copied_folder_gets_a_note() {
+        let writer = |pid: i32, command: &str, files: &[&str]| Writer {
+            pid,
+            command: command.into(),
+            files: files.iter().map(|file| file.to_string()).collect(),
+        };
+        let found = Ok(vec![
+            writer(
+                4242,
+                "bun",
+                &["var/v2.sqlite", "var/v2.sqlite-shm", "var/v2.sqlite-wal", "var/x"],
+            ),
+            writer(4300, "sh", &["dev.log"]),
+        ]);
+        assert_eq!(
+            writer_notes(&found, "main"),
+            [
+                "note: bun (pid 4242) has var/v2.sqlite, var/v2.sqlite-shm, var/v2.sqlite-wal +1 more open for writing \
+                 in main, so the fork's copy may be torn. if that data matters, stop or pause bun (or point it at a copy) \
+                 and fork again",
+                "note: sh (pid 4300) has dev.log open for writing in main, so the fork's copy may be torn. \
+                 if that data matters, stop or pause sh (or point it at a copy) and fork again",
+            ]
+        );
+        assert_eq!(
+            writer_notes(&Ok(vec![writer(4300, "sh", &["dev.log"])]), "fork 3-api")[0],
+            "note: sh (pid 4300) has dev.log open for writing in fork 3-api, so the fork's copy may be torn. \
+             if that data matters, stop or pause sh (or point it at a copy) and fork again"
+        );
+        assert!(writer_notes(&Ok(Vec::new()), "main").is_empty());
+        let failed = Err(anyhow!("lsof didn't finish in 3s"));
+        assert_eq!(
+            writer_notes(&failed, "main"),
+            [
+                "note: pfs couldn't check what's open for writing in main (lsof didn't finish in 3s), \
+              so it can't tell whether the copy caught a file mid-write"
+            ]
+        );
     }
 
     #[test]
