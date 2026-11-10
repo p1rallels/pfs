@@ -360,6 +360,25 @@ check "  …and takes it once that's undone" "$PFS" rm "$id"
 check "  …landing only the fork's own files" test "$(git show --name-only --format= "pfs/$id-landing" pfs/"$id"-landing~1 | sort | tr '\n' ' ')" = "one.txt two.txt "
 git branch -q -D "pfs/$id-landing"
 
+section "pfs ls --names: who each fork is, no git"
+out=$("$PFS" new names)
+id=$(new_id "$out")
+wrap="$work/git-wrap"
+mkdir -p "$wrap"
+printf '#!/bin/sh\necho "$*" >>"%s/calls"\nexec /usr/bin/git "$@"\n' "$wrap" >"$wrap/git"
+chmod +x "$wrap/git"
+: >"$wrap/calls"
+PATH="$wrap:$PATH" "$PFS" ls --names --all --json >/dev/null 2>&1
+check "ls --names --all --json runs no git" test ! -s "$wrap/calls"
+PATH="$wrap:$PATH" "$PFS" ls --all --json >/dev/null 2>&1
+check "  …where the full ls does" test -s "$wrap/calls"
+names_of() { "$PFS" ls "$@" --all --json | jq -c '{id, label}' | sort; }
+check "  …and its ids and labels match the full --json, removed forks included" test "$(names_of --names)" = "$(names_of)"
+check "from inside a fork, --names marks it with *" grep -q "^\* *$id-names" <<<"$("$PFS" run "$id" "$PFS" ls --names)"
+check "--names with --overlap: refused" denied "$PFS" ls --names --overlap
+check "--names outside any repo: refused" denied sh -c "cd '$(mktemp -d)' && '$PFS' ls --names"
+"$PFS" rm "$id" >/dev/null 2>&1
+
 section "pfs rm with several forks"
 a=$(new_id "$("$PFS" new many-a)")
 b=$(new_id "$("$PFS" new many-b)")
