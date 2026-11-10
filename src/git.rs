@@ -239,6 +239,14 @@ pub fn uncommitted_paths(dir: &Path) -> Result<Vec<String>> {
     Ok(nul_list(&changed).chain(nul_list(&untracked)).collect())
 }
 
+/// Whether git tracks `path`, or anything under it, in any letter case: on a
+/// case-insensitive disk `.FORKS` is the folder `.forks`. Reads the index
+/// only, so no filter runs.
+pub fn tracks(dir: &Path, path: &str) -> Result<bool> {
+    let pathspec = format!(":(icase,literal){path}");
+    out(dir, &["ls-files", "-z", "--", &pathspec]).map(|listed| !listed.is_empty())
+}
+
 /// Paths `theirs` changed since it split from `ours`: what merging it writes.
 pub fn incoming_paths(dir: &Path, ours: &str, theirs: &str) -> Result<Vec<String>> {
     let range = format!("{ours}...{theirs}");
@@ -248,4 +256,37 @@ pub fn incoming_paths(dir: &Path, ours: &str, theirs: &str) -> Result<Vec<String
 
 fn nul_list(listed: &str) -> impl Iterator<Item = String> + '_ {
     listed.split('\0').filter(|path| !path.is_empty()).map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pfs-git-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn tracked_files(dir: &Path, files: &[&str]) {
+        files.iter().for_each(|file| {
+            let path = dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "x\n").unwrap();
+        });
+        out(dir, &["add", "-A"]).unwrap();
+    }
+
+    #[test]
+    fn tracks_a_folder_in_any_case_and_nothing_that_only_starts_like_it() {
+        let dir = scratch("tracks");
+        out(&dir, &["init", "-q"]).unwrap();
+        assert!(!tracks(&dir, ".forks").unwrap());
+        tracked_files(&dir, &[".forksy/a", "x/.forks/b", ".forks.md"]);
+        assert!(!tracks(&dir, ".forks").unwrap());
+        tracked_files(&dir, &[".FORKS/ledger.jsonl"]);
+        assert!(tracks(&dir, ".forks").unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

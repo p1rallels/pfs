@@ -885,9 +885,9 @@ mod tests {
         assert_eq!(upkeep(&ls_args(false)), Upkeep::Tidy);
     }
 
-    /// Every folder and file under `dir`, files with their text: equal
+    /// Every folder and file under `dir`, files with their bytes: equal
     /// before and after means nothing was written.
-    fn tree(dir: &Path) -> Vec<(PathBuf, Option<String>)> {
+    fn tree(dir: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
         let mut entries = crate::paths::entries(dir).unwrap();
         entries.sort();
         entries
@@ -896,10 +896,7 @@ mod tests {
                 true => std::iter::once((path.clone(), None))
                     .chain(tree(&path))
                     .collect::<Vec<_>>(),
-                false => vec![(
-                    path.clone(),
-                    Some(String::from_utf8(std::fs::read(&path).unwrap()).unwrap()),
-                )],
+                false => vec![(path.clone(), Some(std::fs::read(&path).unwrap()))],
             })
             .collect()
     }
@@ -912,6 +909,8 @@ mod tests {
             forks: Some(base.join("forks").join("main")),
         };
         let forks = repo.forks.clone().unwrap();
+        std::fs::create_dir_all(&repo.root).unwrap();
+        git(&repo.root, &["init", "-q"]);
         std::fs::create_dir_all(repo.root.join(".git/pfs")).unwrap();
         std::fs::create_dir_all(forks.join("1")).unwrap();
         std::fs::write(repo.root.join(".git/pfs/forks-dir"), format!("{}\n", forks.display())).unwrap();
@@ -924,17 +923,25 @@ mod tests {
         std::fs::write(repo.forks.as_ref().unwrap().join(crate::layout::MAIN), main).unwrap();
     }
 
-    #[test]
-    fn names_leaves_a_0_3_leftover_alone_where_the_full_ls_moves_it() {
-        let base = scratch("names-legacy");
-        let repo = main_with_a_fork(&base);
-        sign(&repo);
-        let old = repo.root.join(crate::layout::LEGACY);
+    /// `.forks/` as a 0.3 leftover looks once its forks are landed, with a
+    /// fork 9 in its ledger: the line that ledger would add.
+    fn plant_leftover(root: &Path) -> String {
+        let old = root.join(crate::layout::LEGACY);
         let planted = serde_json::to_string(&ledger::Event::Fork(entry(9, "planted", None).fork)).unwrap();
         std::fs::create_dir_all(old.join(".rm-4")).unwrap();
         std::fs::write(old.join(".rm-4").join("junk"), "x").unwrap();
         std::fs::write(old.join(".lock"), "").unwrap();
         std::fs::write(old.join("ledger.jsonl"), format!("{planted}\n")).unwrap();
+        format!("{planted}\n")
+    }
+
+    #[test]
+    fn a_ledger_beside_the_live_one_stays_put_under_every_ls() {
+        let base = scratch("names-legacy");
+        let repo = main_with_a_fork(&base);
+        sign(&repo);
+        let old = repo.root.join(crate::layout::LEGACY);
+        plant_leftover(&repo.root);
         let ledger_before = std::fs::read_to_string(repo.ledger()).unwrap();
         let before = tree(&base);
 
@@ -943,13 +950,59 @@ mod tests {
         assert_eq!(in_repo(ls_args(true), place).unwrap(), 0);
         assert_eq!(tree(&base), before, "--names wrote to disk");
 
+        let old_before = tree(&old);
         let place = located(&ls_args(false), &repo.root).unwrap().unwrap();
-        assert!(!old.exists(), "the full ls should finish the move from 0.3");
-        assert_eq!(
-            std::fs::read_to_string(repo.ledger()).unwrap(),
-            format!("{ledger_before}{planted}\n")
+        assert_eq!(place.repo.forks, repo.forks);
+        assert_eq!(tree(&old), old_before, "the full ls touched .forks");
+        assert_eq!(std::fs::read_to_string(repo.ledger()).unwrap(), ledger_before);
+        let ledger = ledger::load(&place.repo).unwrap();
+        assert_eq!(ledger.keys().copied().collect::<Vec<_>>(), [1]);
+        assert_eq!(in_repo(ls_args(true), place).unwrap(), 0);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_tracked_forks_folder_stays_put_on_a_fresh_clone_and_an_untracked_one_moves() {
+        let base = scratch("tracked-legacy");
+        let upstream = base.join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["init", "-q"]);
+        let planted = plant_leftover(&upstream);
+        git(&upstream, &["add", "-A"]);
+        let who = [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        git(
+            &upstream,
+            &[&who[..], &["commit", "-qm", "a ledger for whoever clones"]].concat(),
         );
-        assert!(ledger::load(&place.repo).unwrap().contains_key(&9));
+        git(&base, &["clone", "-q", "upstream", "main"]);
+        let main = base.join("main");
+        let old = main.join(crate::layout::LEGACY);
+        let before = tree(&old);
+
+        let place = located(&ls_args(false), &main).unwrap().unwrap();
+        assert_eq!(tree(&old), before, "a full ls touched a .forks git tracks");
+        assert!(
+            !main.join(".git/pfs").exists(),
+            "nothing to carry, so no .git/pfs either"
+        );
+        assert_eq!((&place.repo.forks, place.fork), (&None, None));
+        assert!(ledger::load(&place.repo).unwrap().is_empty());
+
+        git(&main, &["rm", "-rq", "--cached", ".forks"]);
+        git(
+            &main,
+            &[&who[..], &["commit", "-qm", "untracked: now it's a 0.3 leftover"]].concat(),
+        );
+        let place = located(&ls_args(false), &main).unwrap().unwrap();
+        assert!(!old.exists(), "an untracked leftover with no ledger yet still moves");
+        assert_eq!(std::fs::read_to_string(place.repo.ledger()).unwrap(), planted);
         std::fs::remove_dir_all(&base).unwrap();
     }
 

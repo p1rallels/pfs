@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     config::Global,
-    paths,
+    git, paths,
     place::parse_dir_id,
     store::{self, Lock},
 };
@@ -347,13 +347,46 @@ pub fn legacy_fork_error(top: &Path, root: &Path, id: u32) -> String {
     )
 }
 
+/// Why `migrate` left `<main>/.forks/` as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Left {
+    /// Git tracks something in it: the repo's own files, maybe from
+    /// upstream. pfs 0.3 kept its folder out of git (`/.forks/` in
+    /// `.git/info/exclude`).
+    Tracked,
+    /// Its ledger sits beside the one pfs keeps now, and lines from a folder
+    /// anyone can commit or copy into a repo never join a live ledger.
+    BesideLedger,
+}
+
+/// One line for stderr: which folder, and why.
+pub fn left_note(root: &Path, left: Left) -> String {
+    let folder = paths::tildify(&root.join(LEGACY));
+    match left {
+        Left::Tracked => {
+            format!("{folder} left as it is: git tracks files in it, so it's the repo's own, not pfs 0.3's")
+        }
+        Left::BesideLedger => format!(
+            "{folder} left as it is: .git/pfs/ledger.jsonl already exists and pfs never merges another ledger into it \
+             (if pfs 0.3 wrote {LEGACY}/{LEDGER}, append it there yourself, then remove {LEGACY})"
+        ),
+    }
+}
+
 /// The old ledger moves to `.git/pfs/`, under its lock, so ids carry on;
 /// 0.3's half-done deletes are finished, and `.forks/` goes once it's empty.
-/// Old forks still there stop everything until pfs 0.3 lands them.
-pub fn migrate(root: &Path) -> Result<()> {
+/// Old forks still there stop everything until pfs 0.3 lands them. A
+/// `.forks/` that git tracks, or whose ledger would land beside a live one,
+/// is left as it is, and the reason returned.
+pub fn migrate(root: &Path) -> Result<Option<Left>> {
     let old = root.join(LEGACY);
     if !old.is_dir() {
-        return Ok(());
+        return Ok(None);
+    }
+    let tracked =
+        git::tracks(root, LEGACY).with_context(|| format!("can't tell whether git tracks {}", paths::tildify(&old)))?;
+    if tracked {
+        return Ok(Some(Left::Tracked));
     }
     let entries = paths::entries(&old)?
         .into_iter()
@@ -368,7 +401,9 @@ pub fn migrate(root: &Path) -> Result<()> {
     }
     if let Some(old_ledger) = &found.ledger {
         let _lock = lock(root)?;
-        carry_ledger(old_ledger, &ledger_path(root))?;
+        if carry_ledger(old_ledger, &ledger_path(root))? == Carry::Kept {
+            return Ok(Some(Left::BesideLedger));
+        }
     }
     found.trash.iter().for_each(|trash| {
         let _ = paths::remove_tree(trash);
@@ -377,32 +412,33 @@ pub fn migrate(root: &Path) -> Result<()> {
         let _ = fs::remove_file(old_lock);
     }
     let _ = fs::remove_dir(&old);
-    Ok(())
+    Ok(None)
 }
 
-/// Moved whole, or added to a ledger this pfs already started. Gone
-/// already is fine: another pfs moved it first.
-fn carry_ledger(old: &Path, new: &Path) -> Result<()> {
-    let text = match fs::read_to_string(old) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("can't read {}", old.display())),
-    };
-    match new.exists() {
-        false => fs::rename(old, new).with_context(|| format!("can't move {} to {}", old.display(), new.display())),
-        true => {
-            let current = fs::read_to_string(new).with_context(|| format!("can't read {}", new.display()))?;
-            let separator = match current.is_empty() || current.ends_with('\n') {
-                true => "",
-                false => "\n",
-            };
-            fs::OpenOptions::new()
-                .append(true)
-                .open(new)
-                .and_then(|mut file| file.write_all(format!("{separator}{text}").as_bytes()))
-                .with_context(|| format!("can't add {} to {}", old.display(), new.display()))?;
-            fs::remove_file(old).with_context(|| format!("can't remove {}", old.display()))
-        }
+/// What became of `.forks/ledger.jsonl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carry {
+    Moved,
+    /// Gone already: another pfs moved it first.
+    Gone,
+    /// Left where it is: a ledger is already there.
+    Kept,
+}
+
+/// Moved whole, never into or over a ledger that's there: the only honest
+/// reason for both is two pfs versions racing in one repo, while a
+/// committed or copied-in `.forks/ledger.jsonl` would steer rm, kill,
+/// settle and every label. The link refuses a ledger made a moment ago too.
+fn carry_ledger(old: &Path, new: &Path) -> Result<Carry> {
+    if matches!(old.symlink_metadata(), Err(error) if error.kind() == ErrorKind::NotFound) {
+        return Ok(Carry::Gone);
+    }
+    match fs::hard_link(old, new) {
+        Ok(()) => fs::remove_file(old)
+            .map(|()| Carry::Moved)
+            .with_context(|| format!("can't remove {}", old.display())),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(Carry::Kept),
+        Err(error) => Err(error).with_context(|| format!("can't move {} to {}", old.display(), new.display())),
     }
 }
 
@@ -423,6 +459,61 @@ mod tests {
     fn repo(at: &Path) -> PathBuf {
         fs::create_dir_all(at.join(".git")).unwrap();
         at.to_path_buf()
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} in {}", dir.display());
+    }
+
+    /// A repo git can answer for: `migrate` asks it what it tracks.
+    fn git_repo(at: &Path) -> PathBuf {
+        fs::create_dir_all(at).unwrap();
+        git(at, &["init", "-q"]);
+        at.to_path_buf()
+    }
+
+    /// Every path under `dir`, files with their bytes: equal before and
+    /// after means nothing in it was written, moved or removed.
+    fn files(dir: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        let mut entries = paths::entries(dir).unwrap();
+        entries.sort();
+        entries
+            .into_iter()
+            .flat_map(|path| match path.is_dir() {
+                true => std::iter::once((path.clone(), None))
+                    .chain(files(&path))
+                    .collect::<Vec<_>>(),
+                false => vec![(path.clone(), Some(fs::read(&path).unwrap()))],
+            })
+            .collect()
+    }
+
+    /// `.forks/` as a 0.3 leftover looks once its forks are landed: a
+    /// ledger with a fork 9 in it, a lock and a half-done delete.
+    fn plant_leftover(at: &Path) -> String {
+        let line = "{\"type\":\"fork\",\"id\":9,\"branch\":\"pfs/9-planted\"}\n";
+        let old = at.join(LEGACY);
+        fs::create_dir_all(old.join(".rm-2")).unwrap();
+        fs::write(old.join(".rm-2").join("x"), "x").unwrap();
+        fs::write(old.join(".lock"), "").unwrap();
+        fs::write(old.join(LEDGER), line).unwrap();
+        line.to_string()
     }
 
     fn config(forks_dir: &Path) -> Global {
@@ -556,7 +647,7 @@ mod tests {
     #[test]
     fn the_old_ledger_moves_and_old_forks_stop_it() {
         let base = scratch("legacy");
-        let main = repo(&base.join("toy"));
+        let main = git_repo(&base.join("toy"));
         let old = main.join(LEGACY);
         fs::create_dir_all(old.join(".rm-2")).unwrap();
         fs::write(old.join("ledger.jsonl"), "{\"type\":\"fork\",\"id\":7}\n").unwrap();
@@ -578,17 +669,88 @@ mod tests {
     }
 
     #[test]
-    fn an_old_ledger_found_late_joins_the_new_one() {
+    fn an_old_ledger_found_late_never_joins_the_new_one() {
         let base = scratch("late");
         let old = base.join("old.jsonl");
         let new = base.join("new.jsonl");
         fs::write(&old, "b\n").unwrap();
         fs::write(&new, "a").unwrap();
-        carry_ledger(&old, &new).unwrap();
-        assert_eq!(fs::read_to_string(&new).unwrap(), "a\nb\n");
+        assert_eq!(carry_ledger(&old, &new).unwrap(), Carry::Kept);
+        assert_eq!(fs::read_to_string(&new).unwrap(), "a");
+        assert_eq!(fs::read_to_string(&old).unwrap(), "b\n");
+        fs::remove_file(&new).unwrap();
+        assert_eq!(carry_ledger(&old, &new).unwrap(), Carry::Moved);
+        assert_eq!(fs::read_to_string(&new).unwrap(), "b\n");
         assert!(!old.exists());
-        carry_ledger(&old, &new).unwrap();
+        assert_eq!(carry_ledger(&old, &new).unwrap(), Carry::Gone);
+        assert_eq!(fs::read_to_string(&new).unwrap(), "b\n");
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_ledger_beside_the_live_one_stays_where_it_is() {
+        let base = scratch("beside");
+        let main = git_repo(&base.join("toy"));
+        plant_leftover(&main);
+        fs::create_dir_all(pfs_dir(&main)).unwrap();
+        fs::write(ledger_path(&main), "{\"type\":\"fork\",\"id\":1}\n").unwrap();
+        let seen = || (files(&main.join(LEGACY)), fs::read(ledger_path(&main)).unwrap());
+        let before = seen();
+        assert_eq!(migrate(&main).unwrap(), Some(Left::BesideLedger));
+        assert_eq!(seen(), before, "a ledger from .forks joined the live one");
+        assert_eq!(migrate(&main).unwrap(), Some(Left::BesideLedger));
+        assert_eq!(seen(), before);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_forks_folder_git_tracks_is_the_repo_s_own() {
+        let base = scratch("tracked");
+        let upstream = git_repo(&base.join("upstream"));
+        plant_leftover(&upstream);
+        git(&upstream, &["add", "-A"]);
+        git(&upstream, &["commit", "-qm", "a ledger for whoever clones"]);
+        git(&base, &["clone", "-q", "upstream", "main"]);
+        let main = base.join("main");
+        let before = files(&main.join(LEGACY));
+        assert_eq!(migrate(&main).unwrap(), Some(Left::Tracked));
+        assert_eq!(files(&main.join(LEGACY)), before, "migrate wrote in a tracked .forks");
+        assert!(!pfs_dir(&main).exists(), "migrate made .git/pfs for a tracked .forks");
+
+        fs::create_dir_all(main.join(LEGACY).join("3")).unwrap();
+        fs::write(main.join(LEGACY).join("3").join("notes.md"), "n\n").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "a folder named like a 0.3 fork"]);
+        assert_eq!(migrate(&main).unwrap(), Some(Left::Tracked));
+        assert!(main.join(LEGACY).join(LEDGER).is_file());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_0_3_leftover_with_no_ledger_yet_still_moves() {
+        let base = scratch("leftover");
+        let main = git_repo(&base.join("toy"));
+        let line = plant_leftover(&main);
+        assert_eq!(migrate(&main).unwrap(), None);
+        assert!(!main.join(LEGACY).exists());
+        assert_eq!(fs::read_to_string(ledger_path(&main)).unwrap(), line);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_notes_name_the_folder_and_why() {
+        let root = Path::new("/w/toy");
+        let tracked = left_note(root, Left::Tracked);
+        assert!(tracked.starts_with("/w/toy/.forks left as it is: "), "{tracked}");
+        assert!(tracked.contains("git tracks files in it"), "{tracked}");
+        let beside = left_note(root, Left::BesideLedger);
+        assert!(beside.starts_with("/w/toy/.forks left as it is: "), "{beside}");
+        assert!(beside.contains(".git/pfs/ledger.jsonl already exists"), "{beside}");
+        assert!(
+            beside.contains("append it there yourself, then remove .forks"),
+            "{beside}"
+        );
+        assert!(!tracked.contains('\n') && !beside.contains('\n'));
     }
 
     #[test]

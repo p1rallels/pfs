@@ -65,8 +65,9 @@ impl Place {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Upkeep {
     /// Bring the main's layout up to date: move pfs 0.3's leftovers in
-    /// (`layout::migrate`) and sign its forks folder if `.main` is missing
-    /// or names someone else.
+    /// (`layout::migrate`, which says on stderr when it leaves a `.forks`
+    /// alone) and sign its forks folder if `.main` is missing or names
+    /// someone else.
     Tidy,
     /// Write nothing, for what runs unasked (a session list labelling forks
     /// every minute): the layout is read as it is, 0.3 leftovers and their
@@ -112,7 +113,9 @@ pub fn locate(dir: &Path, upkeep: Upkeep) -> Result<Place> {
         None => {
             let forks = match upkeep {
                 Upkeep::Tidy => {
-                    layout::migrate(&top)?;
+                    if let Some(left) = layout::migrate(&top)? {
+                        eprintln!("pfs: {}", layout::left_note(&top, left));
+                    }
                     layout::home_of(&top)
                 }
                 Upkeep::ReadOnly => layout::home_seen(&top),
@@ -261,7 +264,13 @@ mod tests {
         let base = scratch("legacy");
         let main = base.join("repo");
         let old = main.join(layout::LEGACY).join("4");
-        mkdirs(&[main.join(".git"), old.join(".git")]);
+        mkdirs(&[main.clone(), old.join(".git")]);
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["init", "-q"])
+            .status();
+        assert!(init.unwrap().success());
         let in_old = locate(&old, Upkeep::Tidy).unwrap_err().to_string();
         assert!(in_old.contains("fork 4 from pfs 0.3"), "{in_old}");
         let in_main = locate(&main, Upkeep::Tidy).unwrap_err().to_string();
