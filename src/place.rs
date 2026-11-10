@@ -113,8 +113,11 @@ pub fn locate(dir: &Path, upkeep: Upkeep) -> Result<Place> {
         None => {
             let forks = match upkeep {
                 Upkeep::Tidy => {
-                    if let Some(left) = layout::migrate(&top)? {
-                        eprintln!("pfs: {}", layout::left_note(&top, left));
+                    // a tracked .forks is the repo's own files, not pfs's: left
+                    // alone in silence, or a repo that tracks one would hear it
+                    // on every command
+                    if let Some(layout::Left::BesideLedger) = layout::migrate(&top)? {
+                        eprintln!("pfs: {}", layout::left_note(&top, layout::Left::BesideLedger));
                     }
                     layout::home_of(&top)
                 }

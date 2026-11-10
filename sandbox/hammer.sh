@@ -636,6 +636,26 @@ check "an old .forks/ledger.jsonl is read" contains "$(cd "$mains/legacy" && "$P
 check "  …from .git/pfs, where it moved" grep -q '"id":6' "$mains/legacy/.git/pfs/ledger.jsonl"
 check "  …and the old .forks is gone" test ! -e "$mains/legacy/.forks"
 check "  …the next id continues from it" contains "$(cd "$mains/legacy" && "$PFS" new next)" "created $((last + 1))-next"
+mkdir -p "$mains/legacy/.forks/.rm-2"
+printf '{"type":"fork","id":9,"name":"planted","branch":"pfs/9-planted","ts":"2026-01-01T00:00:00.000Z"}\n' >"$mains/legacy/.forks/ledger.jsonl"
+touch "$mains/legacy/.forks/.lock" "$mains/legacy/.forks/.rm-2/x"
+beside_state() { (cd "$mains/legacy" && find .forks | sort && find .forks -type f -exec shasum {} + | sort && shasum .git/pfs/ledger.jsonl); }
+before=$(beside_state)
+err=$(cd "$mains/legacy" && "$PFS" ls --all 2>&1 >/dev/null)
+check "a .forks/ledger.jsonl beside a live ledger is left as it is" test "$(beside_state)" = "$before"
+check "  …saying so on stderr" contains "$err" "already exists"
+check "  …and its fork never joins the ledger" denied grep -q '"id":9' "$mains/legacy/.git/pfs/ledger.jsonl"
+
+repo "$mains/upstream"
+mkdir -p "$mains/upstream/.forks"
+printf '{"type":"fork","id":9,"name":"planted","branch":"pfs/9-planted","ts":"2026-01-01T00:00:00.000Z"}\n' >"$mains/upstream/.forks/ledger.jsonl"
+git -C "$mains/upstream" add -f .forks/ledger.jsonl
+git -C "$mains/upstream" -c user.name=t -c user.email=t@t commit -q -m forks
+git clone -q "$mains/upstream" "$mains/clone"
+err=$(cd "$mains/clone" && "$PFS" ls 2>&1 >/dev/null)
+check "a .forks git tracks is the repo's own: a fresh clone keeps it as it is" test -f "$mains/clone/.forks/ledger.jsonl" -a ! -e "$mains/clone/.git/pfs/ledger.jsonl"
+check "  …git sees nothing changed" test -z "$(git -C "$mains/clone" status --porcelain)"
+check "  …and pfs says nothing about it" test -z "$err"
 
 repo "$mains/old"
 mkdir -p "$mains/old/.forks/3"
