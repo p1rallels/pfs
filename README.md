@@ -24,7 +24,8 @@ pfs new clean-b --from pfs/8-add-csv  # a clean start at fork 8's latest commit
 pfs ls                           # active forks: work to land, what's running, * = the one you're in
                                  # (outside any repo: every repo's forks, and the ones whose repo is gone)
 pfs ls --names [--all] [--json]  # who each fork is (number, label, branch, folder) from pfs's records alone, no git in any fork:
-                                 # for tools that label forks (pi-web); can't go with --overlap
+                                 # for tools that label forks (pi-web); can't go with --overlap. it writes nothing
+                                 # (no move from 0.3, no signing), so it's safe to run unasked
 pfs run 8 cargo test             # foreground, in the fork, exit code passes through
 pfs run 8 --bg bun dev           # background; pfs logs 8.1 to read it
 pfs diff 8 --stat                # everything fork 8 changed, uncommitted included

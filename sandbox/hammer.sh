@@ -377,6 +377,11 @@ check "  …and its ids and labels match the full --json, removed forks included
 check "from inside a fork, --names marks it with *" grep -q "^\* *$id-names" <<<"$("$PFS" run "$id" "$PFS" ls --names)"
 check "--names with --overlap: refused" denied "$PFS" ls --names --overlap
 check "--names outside any repo: refused" denied sh -c "cd '$(mktemp -d)' && '$PFS' ls --names"
+mv "$forks/.main" "$work/scratch/toy.main"
+"$PFS" ls --names --all --json >/dev/null 2>&1
+check "--names leaves an unsigned forks folder unsigned" test ! -e "$forks/.main"
+"$PFS" ls >/dev/null 2>&1
+check "  …where the full ls signs it again" test "$(cat "$forks/.main")" = "$(real "$toy")"
 "$PFS" rm "$id" >/dev/null 2>&1
 
 section "pfs rm with several forks"
@@ -622,6 +627,11 @@ mkdir -p "$mains/legacy/.forks/.rm-4"
 printf '{"type":"fork","id":6,"name":"old","branch":"pfs/6-old","ts":"2026-01-01T00:00:00.000Z"}\n{"type":"rm","id":6,"ts":"2026-01-01T00:01:00.000Z"}\n' >"$mains/legacy/.forks/ledger.jsonl"
 touch "$mains/legacy/.forks/.lock"
 last=$(jq -r 'select(.type=="fork") | .id' "$mains/legacy/.forks/ledger.jsonl" | sort -n | tail -1)
+touch "$mains/legacy/.forks/.rm-4/x"
+legacy_state() { (cd "$mains/legacy" && find .forks .git/pfs 2>/dev/null | sort && find .forks .git/pfs -type f -exec shasum {} + 2>/dev/null | sort); }
+before=$(legacy_state)
+(cd "$mains/legacy" && "$PFS" ls --names --all --json >/dev/null 2>&1)
+check "ls --names leaves a 0.3 leftover as it is: nothing moved, locked or made" test "$(legacy_state)" = "$before"
 check "an old .forks/ledger.jsonl is read" contains "$(cd "$mains/legacy" && "$PFS" ls --all)" "6-old   removed"
 check "  …from .git/pfs, where it moved" grep -q '"id":6' "$mains/legacy/.git/pfs/ledger.jsonl"
 check "  …and the old .forks is gone" test ! -e "$mains/legacy/.forks"
