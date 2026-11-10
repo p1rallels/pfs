@@ -108,6 +108,15 @@ pub struct LsArgs {
         help = "Then list files two or more forks changed since they started, with those forks (for a merge order)"
     )]
     pub overlap: bool,
+
+    #[arg(
+        long,
+        conflicts_with = "overlap",
+        help = "Only who each fork is (number, label, branch, folder), read from pfs's records. \
+                Skips work and runs, so no git runs in any fork: no snapshot of its folder, none of its filters. \
+                For labelling forks cheaply, e.g. in a session list"
+    )]
+    pub names: bool,
 }
 
 #[derive(Debug, Args)]
@@ -242,6 +251,14 @@ mod tests {
         let args = ls(&["--overlap", "--json", "--all"]).unwrap();
         assert!(args.overlap && args.json && args.all);
         assert!(!ls(&[]).unwrap().overlap);
+    }
+
+    #[test]
+    fn ls_names_goes_with_all_and_json_not_overlap() {
+        let args = ls(&["--names", "--all", "--json"]).unwrap();
+        assert!(args.names && args.all && args.json);
+        assert!(!ls(&[]).unwrap().names);
+        assert!(ls(&["--names", "--overlap"]).is_none());
     }
 
     fn rm(argv: &[&str]) -> Option<RmArgs> {

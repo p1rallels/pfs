@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::Path, thread};
 
 use anyhow::{Result, bail};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     cli::LsArgs,
@@ -26,8 +26,10 @@ pub fn run(args: LsArgs) -> Result<i32> {
 /// Outside any repo: every main's forks, from the forks dir, and the forks
 /// whose main isn't there anymore.
 fn every_repo(args: LsArgs) -> Result<i32> {
-    if args.all || args.json || args.overlap {
-        bail!("--all, --json and --overlap work inside a repo. outside one, `pfs ls` lists every repo's forks");
+    if args.all || args.json || args.overlap || args.names {
+        bail!(
+            "--all, --json, --names and --overlap work inside a repo. outside one, `pfs ls` lists every repo's forks"
+        );
     }
     let config = config::load_global()?;
     let repos = everywhere::scan(&config.forks_dir)?;
@@ -38,7 +40,6 @@ fn every_repo(args: LsArgs) -> Result<i32> {
 }
 
 fn in_repo(args: LsArgs, place: place::Place) -> Result<i32> {
-    let config = config::load_global()?;
     let ledger = ledger::load(&place.repo)?;
     let active: Vec<Fork> = forks::active_ids(&place.repo)
         .into_iter()
@@ -52,30 +53,116 @@ fn in_repo(args: LsArgs, place: place::Place) -> Result<i32> {
             .collect(),
         false => Vec::new(),
     };
+    match args.names {
+        true => names(args.json, place.fork, &active, &removed, removed_count(&ledger))
+            .iter()
+            .for_each(|line| println!("{line}")),
+        false => full(&args, &place, &ledger, &active, &removed, &config::load_global()?),
+    }
+    Ok(0)
+}
+
+fn removed_count(ledger: &ledger::Ledger) -> usize {
+    ledger.values().filter(|entry| entry.removed.is_some()).count()
+}
+
+/// `--names`: who each fork is, from the ledger and the forks folder alone.
+/// No git, so a fork's folder is never snapshotted and none of its filters
+/// run: a session list can label forks without touching their work.
+fn names(json: bool, current: Option<u32>, active: &[Fork], removed: &[&Entry], ever_removed: usize) -> Vec<String> {
+    match (json, active.is_empty() && removed.is_empty()) {
+        (true, _) => active
+            .iter()
+            .map(|fork| identity(fork, current == Some(fork.id)))
+            .chain(removed.iter().map(|entry| removed_identity(entry)))
+            .map(|object| Value::Object(object).to_string())
+            .collect(),
+        (false, true) => vec![empty_note(ever_removed)],
+        (false, false) => name_lines(current, active, removed),
+    }
+}
+
+/// The table's label column, with when each removed fork went.
+fn name_lines(current: Option<u32>, active: &[Fork], removed: &[&Entry]) -> Vec<String> {
+    let labels: Vec<String> = active.iter().map(Fork::label).collect();
+    let removed_labels: Vec<String> = removed.iter().map(|entry| entry.label()).collect();
+    let width = labels
+        .iter()
+        .chain(&removed_labels)
+        .map(|label| label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let active_lines = active.iter().zip(&labels).map(|(fork, label)| {
+        let marker = if current == Some(fork.id) { '*' } else { ' ' };
+        format!("{marker} {label}")
+    });
+    let removed_lines = removed.iter().zip(&removed_labels).map(|(entry, label)| {
+        let ago = entry.removed.as_ref().map(|rm| clock::ago(&rm.ts)).unwrap_or_default();
+        format!("  {label:<width$}   removed {ago} ago")
+    });
+    active_lines.chain(removed_lines).collect()
+}
+
+/// Who an active fork is, from pfs's own records: all `--names` prints, and
+/// where each full `--json` line starts, so the two can't drift apart.
+fn identity(fork: &Fork, current: bool) -> Map<String, Value> {
+    Map::from_iter([
+        ("id".to_string(), json!(fork.id)),
+        ("label".to_string(), json!(fork.label())),
+        ("branch".to_string(), json!(fork.branch())),
+        ("path".to_string(), json!(fork.dir)),
+        ("current".to_string(), json!(current)),
+        ("removed".to_string(), json!(false)),
+    ])
+}
+
+/// `identity`, for a removed fork: its folder is gone.
+fn removed_identity(entry: &Entry) -> Map<String, Value> {
+    Map::from_iter([
+        ("id".to_string(), json!(entry.fork.id)),
+        ("label".to_string(), json!(entry.label())),
+        ("branch".to_string(), json!(entry.fork.branch)),
+        ("removed".to_string(), json!(true)),
+    ])
+}
+
+/// `base` with `more`'s fields added.
+fn extend(base: Map<String, Value>, more: Value) -> Value {
+    match more {
+        Value::Object(more) => Value::Object(base.into_iter().chain(more).collect()),
+        _ => Value::Object(base),
+    }
+}
+
+/// The full listing: each active fork's work (git, in every fork) and runs.
+fn full(
+    args: &LsArgs,
+    place: &place::Place,
+    ledger: &ledger::Ledger,
+    active: &[Fork],
+    removed: &[&Entry],
+    config: &config::Global,
+) {
     let kept = match args.all {
         true => git::branches(&place.repo.root, "pfs/"),
         false => Vec::new(),
     };
     let views: Vec<View> = active
         .iter()
-        .zip(works(&active, args.overlap))
+        .zip(works(active, args.overlap))
         .map(|(fork, work)| view(fork, place.fork, config.ports.block(fork.id), work))
         .collect();
     let shared = args.overlap.then(|| shared(changes(&views)));
     match (args.json, views.is_empty() && removed.is_empty()) {
-        (true, _) => print_json(&views, &removed, &kept, shared.as_deref()),
-        (false, true) => println!(
-            "{}",
-            empty_note(ledger.values().filter(|entry| entry.removed.is_some()).count())
-        ),
+        (true, _) => print_json(&views, removed, &kept, shared.as_deref()),
+        (false, true) => println!("{}", empty_note(removed_count(ledger))),
         (false, false) => {
-            print_table(&views, &removed, &kept);
+            print_table(&views, removed, &kept);
             if let Some(shared) = &shared {
                 print_overlap(&views, shared);
             }
         }
     }
-    Ok(0)
 }
 
 struct View<'a> {
@@ -345,55 +432,55 @@ fn print_overlap(views: &[View], shared: &[(&str, Vec<u32>)]) {
         .for_each(|line| println!("  {line}"));
 }
 
-/// With `--overlap`, each active fork gets `overlap`: the files it shares,
-/// each with the other forks' ids, `{}` for none, `null` if skipped.
 fn print_json(views: &[View], removed: &[&Entry], kept: &[String], shared: Option<&[(&str, Vec<u32>)]>) {
-    views.iter().for_each(|view| {
-        let runs: Vec<Value> = view
-            .runs
-            .iter()
-            .map(|(run, status)| run_json(&view.fork.dir, run, *status))
-            .collect();
-        let entry = view.fork.entry.as_ref().map(|entry| &entry.fork);
-        let mut object = json!({
-                "id": view.fork.id,
-                "label": view.fork.label(),
-                "branch": view.fork.branch(),
-                "path": view.fork.dir,
-                "ports": [view.ports.0, view.ports.1],
-                "current": view.current,
-                "removed": false,
-                "from": entry.and_then(|fork| fork.from.clone()),
-                "of": entry.and_then(|fork| fork.of),
-                "parent_session": entry.and_then(|fork| fork.parent_session.clone()),
-                "created": entry.map(|fork| fork.ts.clone()),
-                "commits": view.work.commits,
-                "uncommitted": view.work.uncommitted,
-                "notes": notes(view),
-                "runs": runs,
-        });
-        if let Some(shared) = shared {
-            object["overlap"] = json!(view.work.changed.as_ref().map(|_| overlap_of(shared, view.fork.id)));
-        }
-        println!("{object}");
-    });
-    removed.iter().for_each(|entry| {
-        let saved = entry.removed.as_ref().and_then(|rm| rm.saved_branch.clone());
-        println!(
-            "{}",
-            json!({
-                "id": entry.fork.id,
-                "label": entry.label(),
-                "branch": entry.fork.branch,
-                "removed": true,
-                "saved_branch_exists": saved.as_ref().map(|branch| kept.contains(branch)),
-                "saved_branch": saved,
-                "from": entry.fork.from,
-                "of": entry.fork.of,
-                "parent_session": entry.fork.parent_session,
-            })
-        );
-    });
+    views
+        .iter()
+        .map(|view| fork_json(view, shared))
+        .chain(removed.iter().map(|entry| removed_json(entry, kept)))
+        .for_each(|object| println!("{object}"));
+}
+
+/// With `--overlap`, an active fork gets `overlap`: the files it shares,
+/// each with the other forks' ids, `{}` for none, `null` if skipped.
+fn fork_json(view: &View, shared: Option<&[(&str, Vec<u32>)]>) -> Value {
+    let runs: Vec<Value> = view
+        .runs
+        .iter()
+        .map(|(run, status)| run_json(&view.fork.dir, run, *status))
+        .collect();
+    let entry = view.fork.entry.as_ref().map(|entry| &entry.fork);
+    let mut object = extend(
+        identity(view.fork, view.current),
+        json!({
+            "ports": [view.ports.0, view.ports.1],
+            "from": entry.and_then(|fork| fork.from.clone()),
+            "of": entry.and_then(|fork| fork.of),
+            "parent_session": entry.and_then(|fork| fork.parent_session.clone()),
+            "created": entry.map(|fork| fork.ts.clone()),
+            "commits": view.work.commits,
+            "uncommitted": view.work.uncommitted,
+            "notes": notes(view),
+            "runs": runs,
+        }),
+    );
+    if let Some(shared) = shared {
+        object["overlap"] = json!(view.work.changed.as_ref().map(|_| overlap_of(shared, view.fork.id)));
+    }
+    object
+}
+
+fn removed_json(entry: &Entry, kept: &[String]) -> Value {
+    let saved = entry.removed.as_ref().and_then(|rm| rm.saved_branch.clone());
+    extend(
+        removed_identity(entry),
+        json!({
+            "saved_branch_exists": saved.as_ref().map(|branch| kept.contains(branch)),
+            "saved_branch": saved,
+            "from": entry.fork.from,
+            "of": entry.fork.of,
+            "parent_session": entry.fork.parent_session,
+        }),
+    )
 }
 
 fn run_json(fork_dir: &Path, run: &Run, status: Status) -> Value {
@@ -412,6 +499,8 @@ fn run_json(fork_dir: &Path, run: &Run, status: Status) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn fork(from: Option<&str>, of: Option<u32>, base: Option<&str>) -> ledger::Fork {
@@ -613,5 +702,155 @@ mod tests {
             empty_note(16),
             "no active forks (16 removed: `pfs ls --all`). `pfs new <name>` makes one"
         );
+    }
+
+    fn entry(id: u32, name: &str, removed: Option<&str>) -> Entry {
+        Entry {
+            fork: ledger::Fork {
+                id,
+                name: Some(name.into()),
+                branch: format!("pfs/{id}-{name}"),
+                base: Some("abc".into()),
+                from: Some("HEAD~1".into()),
+                of: Some(1),
+                parent_session: Some("01a1".into()),
+                ts: clock::now(),
+            },
+            removed: removed.map(|saved| ledger::Rm {
+                id,
+                saved_branch: Some(saved.into()),
+                ts: clock::now(),
+            }),
+        }
+    }
+
+    fn active_fork(id: u32, name: &str) -> Fork {
+        Fork {
+            id,
+            dir: PathBuf::from(format!("/f/r/{id}")),
+            entry: Some(entry(id, name, None)),
+        }
+    }
+
+    /// Every field `names` keeps, with the full line's value for it.
+    fn kept_as_is(names: &Map<String, Value>, full: &Value) -> bool {
+        names.iter().all(|(key, value)| full.get(key) == Some(value))
+    }
+
+    #[test]
+    fn names_json_is_the_full_json_minus_what_takes_git_or_runs() {
+        let fork = active_fork(3, "web-subs");
+        let names = identity(&fork, true);
+        let keys: Vec<&str> = names.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["branch", "current", "id", "label", "path", "removed"]);
+        assert_eq!(
+            (names["id"].as_u64(), names["label"].as_str()),
+            (Some(3), Some("3-web-subs"))
+        );
+        let view = View {
+            fork: &fork,
+            current: true,
+            ports: (40030, 40039),
+            runs: Vec::new(),
+            work: Work::default(),
+        };
+        assert!(kept_as_is(&names, &fork_json(&view, None)));
+
+        let gone = entry(2, "wait", Some("pfs/2-wait"));
+        let names = removed_identity(&gone);
+        let keys: Vec<&str> = names.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["branch", "id", "label", "removed"]);
+        assert!(kept_as_is(&names, &removed_json(&gone, &[])));
+    }
+
+    #[test]
+    fn names_text_is_the_label_column_and_when_removed_ones_went() {
+        let active = [active_fork(3, "web-subs"), active_fork(12, "a")];
+        let gone = entry(2, "wait", Some("pfs/2-wait"));
+        assert_eq!(
+            names(false, Some(12), &active, &[&gone], 1),
+            ["  3-web-subs", "* 12-a", "  2-wait       removed 0s ago"]
+        );
+        assert_eq!(names(false, None, &[], &[], 1), [empty_note(1)]);
+        assert!(names(true, None, &[], &[], 1).is_empty());
+        let lines = names(true, Some(3), &active[..1], &[&gone], 1);
+        let parsed: Vec<Value> = lines.iter().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(
+            parsed,
+            [
+                json!({"id": 3, "label": "3-web-subs", "branch": "pfs/3-web-subs", "path": "/f/r/3", "current": true, "removed": false}),
+                json!({"id": 2, "label": "2-wait", "branch": "pfs/2-wait", "removed": true}),
+            ]
+        );
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pfs-ls-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} in {}", dir.display());
+    }
+
+    /// A main with one fork, as `pfs new` leaves them, whose git runs a clean
+    /// filter on `*.txt` that leaves `marker` behind.
+    fn main_with_a_filtered_fork(base: &Path, marker: &Path) -> place::Place {
+        let (main, forks) = (base.join("main"), base.join("forks").join("main"));
+        let fork = forks.join("1");
+        [&main, &fork].iter().for_each(|dir| {
+            std::fs::create_dir_all(dir).unwrap();
+            git(dir, &["init", "-q"]);
+        });
+        std::fs::create_dir_all(main.join(".git/pfs")).unwrap();
+        std::fs::write(main.join(".git/pfs/forks-dir"), format!("{}\n", forks.display())).unwrap();
+        std::fs::write(forks.join(crate::layout::MAIN), format!("{}\n", main.display())).unwrap();
+        let clean = format!("touch '{}' && cat", marker.display());
+        git(&fork, &["config", "filter.mark.clean", &clean]);
+        std::fs::write(fork.join(".gitattributes"), "*.txt filter=mark\n").unwrap();
+        std::fs::write(fork.join("a.txt"), "a\n").unwrap();
+        let place = place::locate(&main).unwrap();
+        let gone = entry(2, "wait", Some("pfs/2-wait"));
+        [
+            ledger::Event::Fork(entry(1, "web-subs", None).fork),
+            ledger::Event::Fork(gone.fork),
+            ledger::Event::Rm(gone.removed.unwrap()),
+        ]
+        .iter()
+        .for_each(|event| ledger::append(&place.repo, event).unwrap());
+        place
+    }
+
+    #[test]
+    fn names_runs_no_git_where_the_full_ls_runs_a_forks_filter() {
+        let base = scratch("names-no-git");
+        let marker = base.join("filter-ran");
+        let place = main_with_a_filtered_fork(&base, &marker);
+        let fork_git = place.repo.fork_dir(1).unwrap().join(".git");
+        let args = |names| LsArgs {
+            all: true,
+            json: true,
+            overlap: false,
+            names,
+        };
+        assert_eq!(in_repo(args(true), place.clone()).unwrap(), 0);
+        assert!(!marker.exists(), "--names ran the fork's clean filter");
+        assert!(!fork_git.join("pfs").exists() && !fork_git.join("index").exists());
+
+        let ledger = ledger::load(&place.repo).unwrap();
+        let active = [forks::require(&place.repo, &ledger, 1).unwrap()];
+        assert_eq!(works(&active, false)[0].uncommitted, Some(true));
+        assert!(marker.exists(), "the full ls's snapshot should run it");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }
