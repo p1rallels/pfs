@@ -9,7 +9,9 @@ use crate::{
     forks::{self, Fork},
     git,
     ledger::{self, Entry},
-    paths, place, ports,
+    paths,
+    place::{self, Upkeep},
+    ports,
     runs::{self, Kind, Run, Status},
 };
 
@@ -17,9 +19,23 @@ use crate::{
 const BIG_LOG: u64 = 1024 * 1024 * 1024;
 
 pub fn run(args: LsArgs) -> Result<i32> {
-    match place::try_here()? {
+    match located(&args, &place::current_dir()?)? {
         Some(place) => in_repo(args, place),
         None => every_repo(args),
+    }
+}
+
+fn located(args: &LsArgs, cwd: &Path) -> Result<Option<place::Place>> {
+    place::try_locate(cwd, upkeep(args))
+}
+
+/// `--names` writes nothing: a session list runs it on its own, in any repo
+/// it lists, so it can't be what moves a repo's `.forks/ledger.jsonl` into
+/// pfs's ledger or signs a forks folder.
+fn upkeep(args: &LsArgs) -> Upkeep {
+    match args.names {
+        true => Upkeep::ReadOnly,
+        false => Upkeep::Tidy,
     }
 }
 
@@ -819,7 +835,7 @@ mod tests {
         git(&fork, &["config", "filter.mark.clean", &clean]);
         std::fs::write(fork.join(".gitattributes"), "*.txt filter=mark\n").unwrap();
         std::fs::write(fork.join("a.txt"), "a\n").unwrap();
-        let place = place::locate(&main).unwrap();
+        let place = place::locate(&main, Upkeep::Tidy).unwrap();
         let gone = entry(2, "wait", Some("pfs/2-wait"));
         [
             ledger::Event::Fork(entry(1, "web-subs", None).fork),
@@ -851,6 +867,117 @@ mod tests {
         let active = [forks::require(&place.repo, &ledger, 1).unwrap()];
         assert_eq!(works(&active, false)[0].uncommitted, Some(true));
         assert!(marker.exists(), "the full ls's snapshot should run it");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    fn ls_args(names: bool) -> LsArgs {
+        LsArgs {
+            all: true,
+            json: true,
+            overlap: false,
+            names,
+        }
+    }
+
+    #[test]
+    fn only_names_reads_without_tidying() {
+        assert_eq!(upkeep(&ls_args(true)), Upkeep::ReadOnly);
+        assert_eq!(upkeep(&ls_args(false)), Upkeep::Tidy);
+    }
+
+    /// Every folder and file under `dir`, files with their text: equal
+    /// before and after means nothing was written.
+    fn tree(dir: &Path) -> Vec<(PathBuf, Option<String>)> {
+        let mut entries = crate::paths::entries(dir).unwrap();
+        entries.sort();
+        entries
+            .into_iter()
+            .flat_map(|path| match path.is_dir() {
+                true => std::iter::once((path.clone(), None))
+                    .chain(tree(&path))
+                    .collect::<Vec<_>>(),
+                false => vec![(
+                    path.clone(),
+                    Some(String::from_utf8(std::fs::read(&path).unwrap()).unwrap()),
+                )],
+            })
+            .collect()
+    }
+
+    /// A main with fork 1 in its forks folder and in its ledger, as `pfs new`
+    /// leaves them, minus the folder's `.main`.
+    fn main_with_a_fork(base: &Path) -> place::Repo {
+        let repo = place::Repo {
+            root: base.join("main"),
+            forks: Some(base.join("forks").join("main")),
+        };
+        let forks = repo.forks.clone().unwrap();
+        std::fs::create_dir_all(repo.root.join(".git/pfs")).unwrap();
+        std::fs::create_dir_all(forks.join("1")).unwrap();
+        std::fs::write(repo.root.join(".git/pfs/forks-dir"), format!("{}\n", forks.display())).unwrap();
+        ledger::append(&repo, &ledger::Event::Fork(entry(1, "web-subs", None).fork)).unwrap();
+        repo
+    }
+
+    fn sign(repo: &place::Repo) {
+        let main = format!("{}\n", repo.root.display());
+        std::fs::write(repo.forks.as_ref().unwrap().join(crate::layout::MAIN), main).unwrap();
+    }
+
+    #[test]
+    fn names_leaves_a_0_3_leftover_alone_where_the_full_ls_moves_it() {
+        let base = scratch("names-legacy");
+        let repo = main_with_a_fork(&base);
+        sign(&repo);
+        let old = repo.root.join(crate::layout::LEGACY);
+        let planted = serde_json::to_string(&ledger::Event::Fork(entry(9, "planted", None).fork)).unwrap();
+        std::fs::create_dir_all(old.join(".rm-4")).unwrap();
+        std::fs::write(old.join(".rm-4").join("junk"), "x").unwrap();
+        std::fs::write(old.join(".lock"), "").unwrap();
+        std::fs::write(old.join("ledger.jsonl"), format!("{planted}\n")).unwrap();
+        let ledger_before = std::fs::read_to_string(repo.ledger()).unwrap();
+        let before = tree(&base);
+
+        let place = located(&ls_args(true), &repo.root).unwrap().unwrap();
+        assert_eq!(place.repo.forks, repo.forks);
+        assert_eq!(in_repo(ls_args(true), place).unwrap(), 0);
+        assert_eq!(tree(&base), before, "--names wrote to disk");
+
+        let place = located(&ls_args(false), &repo.root).unwrap().unwrap();
+        assert!(!old.exists(), "the full ls should finish the move from 0.3");
+        assert_eq!(
+            std::fs::read_to_string(repo.ledger()).unwrap(),
+            format!("{ledger_before}{planted}\n")
+        );
+        assert!(ledger::load(&place.repo).unwrap().contains_key(&9));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn names_leaves_an_unsigned_or_stale_forks_folder_as_it_is() {
+        let base = scratch("names-unsigned");
+        let repo = main_with_a_fork(&base);
+        let forks = repo.forks.clone().unwrap();
+        let dot_main = forks.join(crate::layout::MAIN);
+        [None, Some("/gone/main\n")].iter().for_each(|named| {
+            let _ = std::fs::remove_file(&dot_main);
+            if let Some(named) = named {
+                std::fs::write(&dot_main, named).unwrap();
+            }
+            let before = tree(&base);
+            let place = located(&ls_args(true), &repo.root).unwrap().unwrap();
+            assert_eq!(place.repo.forks, repo.forks);
+            assert_eq!(in_repo(ls_args(true), place).unwrap(), 0);
+            assert_eq!(
+                tree(&base),
+                before,
+                "--names signed a forks folder whose .main was {named:?}"
+            );
+
+            located(&ls_args(false), &repo.root).unwrap().unwrap();
+            assert_eq!(crate::layout::main_named(&forks), Some(repo.root.clone()));
+            assert!(forks.join(crate::layout::SIGN).is_file());
+        });
         std::fs::remove_dir_all(&base).unwrap();
     }
 }

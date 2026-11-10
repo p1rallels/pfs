@@ -112,16 +112,23 @@ fn claim(home: &Path, root: &Path) -> Claim {
 /// copy, and a copy never takes over the original's forks). A main that
 /// moved signs its folder again, so its forks know it.
 pub fn home_of(root: &Path) -> Option<PathBuf> {
+    let (home, claim) = found_home(root)?;
+    if matches!(claim, Claim::Unsigned | Claim::Stale) && home.is_dir() {
+        let _ = sign(&home, root);
+    }
+    Some(home)
+}
+
+/// `home_of` without signing: the same folder, its `.main` left as it is.
+pub fn home_seen(root: &Path) -> Option<PathBuf> {
+    found_home(root).map(|(home, _)| home)
+}
+
+fn found_home(root: &Path) -> Option<(PathBuf, Claim)> {
     let home = resolved(&recorded(root)?);
     match claim(&home, root) {
-        Claim::Ours => Some(home),
         Claim::Taken => None,
-        Claim::Unsigned | Claim::Stale => {
-            if home.is_dir() {
-                let _ = sign(&home, root);
-            }
-            Some(home)
-        }
+        claim => Some((home, claim)),
     }
 }
 
@@ -491,6 +498,7 @@ mod tests {
         let copy = repo(&base.join("copy").join("toy"));
         fs::create_dir_all(pfs_dir(&copy)).unwrap();
         fs::copy(record_path(&main), record_path(&copy)).unwrap();
+        assert_eq!(home_seen(&copy), None);
         assert_eq!(home_of(&copy), None);
         assert_eq!(home_for_new(&copy, &config(&forks)).unwrap(), forks.join("toy-2"));
         assert_eq!(main_named(&home), Some(main.clone()));
@@ -498,6 +506,8 @@ mod tests {
         let moved = base.join("moved");
         fs::rename(&main, &moved).unwrap();
         assert!(!claims(&main, &home));
+        assert_eq!(home_seen(&moved), Some(home.clone()));
+        assert_eq!(main_named(&home), Some(main.clone()));
         assert_eq!(home_of(&moved), Some(home.clone()));
         assert_eq!(main_named(&home), Some(moved.clone()));
         assert!(

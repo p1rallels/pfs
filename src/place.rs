@@ -61,24 +61,39 @@ impl Place {
     }
 }
 
-pub fn here() -> Result<Place> {
-    let cwd = std::env::current_dir().context("can't read the current folder")?;
-    locate(&cwd)
+/// What finding the place may write first, in a main folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upkeep {
+    /// Bring the main's layout up to date: move pfs 0.3's leftovers in
+    /// (`layout::migrate`) and sign its forks folder if `.main` is missing
+    /// or names someone else.
+    Tidy,
+    /// Write nothing, for what runs unasked (a session list labelling forks
+    /// every minute): the layout is read as it is, 0.3 leftovers and their
+    /// ledger ignored, an unsigned forks folder left unsigned.
+    ReadOnly,
 }
 
-/// `here`, or `None` outside any repo.
-pub fn try_here() -> Result<Option<Place>> {
-    let cwd = std::env::current_dir().context("can't read the current folder")?;
-    let resolved = cwd
+pub fn current_dir() -> Result<PathBuf> {
+    std::env::current_dir().context("can't read the current folder")
+}
+
+pub fn here() -> Result<Place> {
+    locate(&current_dir()?, Upkeep::Tidy)
+}
+
+/// `locate`, or `None` outside any repo.
+pub fn try_locate(dir: &Path, upkeep: Upkeep) -> Result<Option<Place>> {
+    let resolved = dir
         .canonicalize()
-        .with_context(|| format!("can't resolve {}", cwd.display()))?;
+        .with_context(|| format!("can't resolve {}", dir.display()))?;
     match nearest_repo(&resolved) {
         None => Ok(None),
-        Some(_) => locate(&cwd).map(Some),
+        Some(_) => locate(dir, upkeep).map(Some),
     }
 }
 
-pub fn locate(dir: &Path) -> Result<Place> {
+pub fn locate(dir: &Path, upkeep: Upkeep) -> Result<Place> {
     let cwd = dir
         .canonicalize()
         .with_context(|| format!("can't resolve {}", dir.display()))?;
@@ -95,8 +110,13 @@ pub fn locate(dir: &Path) -> Result<Place> {
             Some(id),
         ),
         None => {
-            layout::migrate(&top)?;
-            let forks = layout::home_of(&top);
+            let forks = match upkeep {
+                Upkeep::Tidy => {
+                    layout::migrate(&top)?;
+                    layout::home_of(&top)
+                }
+                Upkeep::ReadOnly => layout::home_seen(&top),
+            };
             (Repo { root: top, forks }, None)
         }
     };
@@ -195,13 +215,13 @@ mod tests {
         let fork = forks.join("3");
         let nested = fork.join("fixtures").join("toy");
         mkdirs(&[fork.join(".git"), nested.join(".git"), fork.join("src")]);
-        let in_fork = locate(&fork.join("src")).unwrap();
+        let in_fork = locate(&fork.join("src"), Upkeep::Tidy).unwrap();
         assert_eq!(in_fork.fork, Some(3));
         assert_eq!(in_fork.repo.root, main);
         assert_eq!(in_fork.repo.fork_dir(5), Some(forks.join("5")));
-        let in_main = locate(&main).unwrap();
+        let in_main = locate(&main, Upkeep::Tidy).unwrap();
         assert_eq!((in_main.fork, in_main.repo.forks), (None, Some(forks.clone())));
-        let in_nested = locate(&nested).unwrap();
+        let in_nested = locate(&nested, Upkeep::Tidy).unwrap();
         assert_eq!((in_nested.fork, in_nested.repo.forks), (None, None));
         assert_eq!(in_nested.repo.root, nested);
         std::fs::remove_dir_all(&base).unwrap();
@@ -214,10 +234,10 @@ mod tests {
         let fork = forks.join("3");
         mkdirs(&[fork.join(".git")]);
         std::fs::write(main.join(".git/pfs/forks-dir"), "/somewhere/else\n").unwrap();
-        let place = locate(&fork).unwrap();
+        let place = locate(&fork, Upkeep::Tidy).unwrap();
         assert_eq!((place.fork, place.repo.root), (None, fork.clone()));
         std::fs::remove_file(main.join(".git/pfs/forks-dir")).unwrap();
-        assert_eq!(locate(&fork).unwrap().fork, None);
+        assert_eq!(locate(&fork, Upkeep::Tidy).unwrap().fork, None);
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -229,9 +249,9 @@ mod tests {
         mkdirs(&[fork.join(".git")]);
         let moved = base.join("moved");
         std::fs::rename(&main, &moved).unwrap();
-        assert_eq!(locate(&fork).unwrap().fork, None);
-        assert_eq!(locate(&moved).unwrap().repo.forks, Some(forks.clone()));
-        let again = locate(&fork).unwrap();
+        assert_eq!(locate(&fork, Upkeep::Tidy).unwrap().fork, None);
+        assert_eq!(locate(&moved, Upkeep::Tidy).unwrap().repo.forks, Some(forks.clone()));
+        let again = locate(&fork, Upkeep::Tidy).unwrap();
         assert_eq!((again.fork, again.repo.root), (Some(2), moved));
         std::fs::remove_dir_all(&base).unwrap();
     }
@@ -242,10 +262,14 @@ mod tests {
         let main = base.join("repo");
         let old = main.join(layout::LEGACY).join("4");
         mkdirs(&[main.join(".git"), old.join(".git")]);
-        let in_old = locate(&old).unwrap_err().to_string();
+        let in_old = locate(&old, Upkeep::Tidy).unwrap_err().to_string();
         assert!(in_old.contains("fork 4 from pfs 0.3"), "{in_old}");
-        let in_main = locate(&main).unwrap_err().to_string();
+        let in_main = locate(&main, Upkeep::Tidy).unwrap_err().to_string();
         assert!(in_main.contains("forks from pfs 0.3 (4)"), "{in_main}");
+        assert!(locate(&old, Upkeep::ReadOnly).is_err());
+        let read_only = locate(&main, Upkeep::ReadOnly).unwrap();
+        assert_eq!((read_only.fork, read_only.repo.forks), (None, None));
+        assert!(old.join(".git").is_dir());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
